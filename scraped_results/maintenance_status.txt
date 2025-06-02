@@ -1,0 +1,14 @@
+Maintenance detected at: 2025-06-02T11:07:25.798212
+Current URL: https://buyee.jp/item/search/query/%E9%81%8A%E6%88%AF%E7%8E%8B%20%E3%83%AC%E3%82%A2%E3%82%AB%E3%83%BC%E3%83%89
+Page title: Search Results for "遊戯王 レアカード" /【Buyee】 Buyee - Japanese Proxy Service | Buy from Japan!
+Search term: 遊戯王 レアカード
+Page source (first 1000 chars):
+<html class="no-js" lang="en" style="height: 100%;"><head>
+  <meta charset="utf-8">
+  <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1">
+  <title>Search Results for "遊戯王 レアカード" /【Buyee】 Buyee - Japanese Proxy Service | Buy from Japan!</title>
+  <meta name="keywords" content="遊戯王 レアカード, Buyee, JDirectItems Auction, バイイー, 入札, 日本">
+  <meta name="description" content="Buyee - Bid on JDirectItems Auction in Real-Time and Shop on Popular Japanese Websites! Buy 遊戯王 レアカード from Overseas!">
+              <link rel="canonical" href="https://buyee.jp/item/search/query/%E9%81%8A%E6%88%AF%E7%8E%8B%20%E3%83%AC%E3%82%A2%E3%82%AB%E3%83%BC%E3%83%89?lang=en">
+      <link rel="alternate" href="https://buyee.jp/item/search/query/%E9%81%8A%E6%88%AF%E7%8E%8B%20%E3%83%AC%E3%82%A2%E3%82%AB%E3%83%BC%E3%83%89?lang=cht" hreflang="zh-Hant">
+      <link rel="alternate" href="https://buyee.jp/item/search/query/%E9%81%8A%E6%88%AF%E7%8E%8B%20%E3%83%AC%E3%82%A2%E3%82%AB%E3%83%BC%E3%83%89?lang=chs" hreflang=
