@@ -59,49 +59,37 @@ class BuyeeScraper:
         os.makedirs(self.output_dir, exist_ok=True)
         self.setup_driver()
 
-    def save_debug_info(self, search_term: str, error_type: str, page_source: str = None, screenshot: bool = True):
-        """Save debug information including page source and screenshot."""
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        debug_dir = os.path.join(self.output_dir, "debug")
-        os.makedirs(debug_dir, exist_ok=True)
-        
-        # Save page source
-        if page_source:
-            source_path = os.path.join(debug_dir, f"page_source_{error_type}_{search_term}_{timestamp}.html")
-            with open(source_path, "w", encoding="utf-8") as f:
-                f.write(page_source)
-            logger.info(f"Saved page source to {source_path}")
-        
-        # Save screenshot
-        if screenshot:
-            try:
-                screenshot_path = os.path.join(debug_dir, f"screenshot_{error_type}_{search_term}_{timestamp}.png")
-                self.driver.save_screenshot(screenshot_path)
-                logger.info(f"Saved screenshot to {screenshot_path}")
-            except Exception as e:
-                logger.error(f"Failed to save screenshot: {str(e)}")
-        
-        # Save system info
+    def sanitize_filename(self, filename: str) -> str:
+        """Sanitize a string to be used as a valid filename on Windows."""
+        # Replace invalid characters with underscores
+        invalid_chars = r'[<>:"/\\|?*]'
+        sanitized = re.sub(invalid_chars, '_', filename)
+        # Remove any leading/trailing spaces and dots
+        sanitized = sanitized.strip('. ')
+        # Ensure the filename isn't too long (Windows has a 255 character limit)
+        if len(sanitized) > 240:  # Leave room for extension
+            sanitized = sanitized[:240]
+        return sanitized
+
+    def save_debug_info(self, identifier: str, error_type: str, page_source: str) -> None:
+        """Save debug information about a failed request."""
         try:
-            system_info = {
-                "timestamp": timestamp,
-                "error_type": error_type,
-                "search_term": search_term,
-                "chrome_version": self.driver.capabilities.get('chrome', {}).get('chromedriverVersion', 'unknown'),
-                "platform": self.driver.capabilities.get('platformName', 'unknown'),
-                "browser_version": self.driver.capabilities.get('browserVersion', 'unknown'),
-                "user_agent": self.driver.execute_script("return navigator.userAgent"),
-                "timezone": self.driver.execute_script("return Intl.DateTimeFormat().resolvedOptions().timeZone"),
-                "system_time": datetime.now().isoformat()
-            }
+            # Sanitize the identifier for use in filenames
+            safe_identifier = self.sanitize_filename(identifier)
             
-            system_info_path = os.path.join(debug_dir, f"system_info_{error_type}_{search_term}_{timestamp}.json")
-            with open(system_info_path, "w", encoding="utf-8") as f:
-                json.dump(system_info, f, ensure_ascii=False, indent=2)
-            logger.info(f"Saved system info to {system_info_path}")
+            debug_dir = os.path.join(self.output_dir, "debug")
+            os.makedirs(debug_dir, exist_ok=True)
+            
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"{safe_identifier}_{error_type}_{timestamp}.html"
+            filepath = os.path.join(debug_dir, filename)
+            
+            with open(filepath, "w", encoding="utf-8") as f:
+                f.write(page_source)
+            logger.info(f"Saved debug info to {filepath}")
             
         except Exception as e:
-            logger.error(f"Failed to save system info: {str(e)}")
+            logger.error(f"Error saving debug info: {str(e)}")
 
     def setup_driver(self):
         """Set up and return a configured Chrome WebDriver instance."""
@@ -321,7 +309,7 @@ class BuyeeScraper:
                 try:
                     logger.info(f"Waiting for item container: {analysis['item_analysis']['container_selector']}")
                     item_container = WebDriverWait(self.driver, 20).until(
-                        EC.presence_of_element_located((By.CSS_SELECTOR, analysis['item_analysis']['container_selector']))
+                        EC.presence_of_element_located((By.CSS_SELECTOR, analysis['item_analysis']['item_selector']))
                     )
                     analysis["has_item_container"] = True
                     analysis["item_analysis"]["container_found"] = True
@@ -812,12 +800,61 @@ class BuyeeScraper:
             logger.warning(f"Error handling cookie pop-up: {e}")
             return False
 
+    def save_initial_promising_links(self, item_summaries: List[Dict[str, Any]], search_term: str) -> None:
+        """Save initial promising links to a separate file before detailed analysis."""
+        if not item_summaries:
+            logger.warning(f"No promising items to save for search term: {search_term}")
+            return
+        
+        try:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            base_filename = f"initial_leads_{search_term}_{timestamp}"
+            
+            # Prepare data for saving
+            leads_data = []
+            for summary in item_summaries:
+                # Extract Yahoo Auction ID from Buyee URL
+                yahoo_id_match = re.search(r'/([a-z]\d+)(?:\?|$)', summary['url'])
+                yahoo_auction_id = yahoo_id_match.group(1) if yahoo_id_match else None
+                yahoo_auction_url = f"https://page.auctions.yahoo.co.jp/jp/auction/{yahoo_auction_id}" if yahoo_auction_id else None
+                
+                lead_info = {
+                    'title': summary['title'],
+                    'buyee_url': summary['url'],
+                    'yahoo_auction_id': yahoo_auction_id,
+                    'yahoo_auction_url': yahoo_auction_url,
+                    'price_yen': summary['price_yen'],
+                    'price_text': summary['price_text'],
+                    'thumbnail_url': summary['thumbnail_url'],
+                    'preliminary_analysis': summary['preliminary_analysis'],
+                    'timestamp': timestamp
+                }
+                leads_data.append(lead_info)
+            
+            # Save as CSV
+            df = pd.DataFrame(leads_data)
+            csv_path = os.path.join(self.output_dir, f"{base_filename}.csv")
+            df.to_csv(csv_path, index=False, encoding='utf-8')
+            logger.info(f"Saved {len(leads_data)} initial promising leads to {csv_path}")
+            
+            # Save as JSON
+            json_path = os.path.join(self.output_dir, f"{base_filename}.json")
+            with open(json_path, 'w', encoding='utf-8') as f:
+                json.dump(leads_data, f, ensure_ascii=False, indent=2)
+            logger.info(f"Saved {len(leads_data)} initial promising leads to {json_path}")
+            
+        except Exception as e:
+            logger.error(f"Error saving initial promising links: {str(e)}")
+            logger.error(traceback.format_exc())
+
     def search_items(self, search_term: str) -> List[Dict[str, Any]]:
         """Search for items using the given search term."""
         items = []
         max_retries = 3
         base_delay = 30  # seconds
         max_delay = 300  # maximum delay of 5 minutes
+        
+        logger.info(f"Starting search for term: {search_term}")
         
         for attempt in range(max_retries):
             try:
@@ -826,7 +863,7 @@ class BuyeeScraper:
                 
                 # Construct search URL with sorting by popularity
                 encoded_term = quote(search_term)
-                search_url = f"https://buyee.jp/item/search/query/{encoded_term}?sort=popularity"  # Added sort parameter
+                search_url = f"https://buyee.jp/item/search/query/{encoded_term}?sort=popularity"
                 
                 logger.info(f"Attempting search (attempt {attempt + 1}/{max_retries}): {search_url}")
                 
@@ -857,12 +894,61 @@ class BuyeeScraper:
                 if state == 'ready':
                     # Page is ready, proceed with scraping
                     logger.info("Page is ready, proceeding with scraping")
-                    items = self.scrape_items()
-                    if items:
-                        logger.info(f"Successfully scraped {len(items)} valuable items")
+                    
+                    # Phase 1: Get promising items from search page
+                    promising_summaries = self.get_item_summaries_from_search_page()
+                    if promising_summaries:
+                        logger.info(f"Found {len(promising_summaries)} promising items after initial filtering")
+                        
+                        # Save initial promising links before detailed analysis
+                        self.save_initial_promising_links(promising_summaries, search_term)
+                        
+                        # Phase 2: Process each item's detail page
+                        logger.info("Phase 2: Processing item detail pages")
+                        
+                        # TEST MODE: Only process the first item
+                        test_summaries = promising_summaries[:1]
+                        logger.info(f"TEST MODE: Processing only the first item: {test_summaries[0]['title']}")
+                        
+                        for summary in test_summaries:
+                            try:
+                                logger.info(f"Processing item: {summary['title']}")
+                                logger.debug(f"Item URL: {summary['url']}")
+                                logger.debug(f"Price: {summary['price_yen']} yen")
+                                logger.debug(f"Preliminary Analysis - Valuable: {summary['preliminary_analysis']['is_valuable']}, "
+                                           f"Confidence: {summary['preliminary_analysis']['confidence_score']}")
+                                
+                                # Skip items with low confidence scores
+                                if summary['preliminary_analysis']['confidence_score'] < 0.3:
+                                    logger.info(f"Skipping item - Low confidence score: {summary['preliminary_analysis']['confidence_score']}")
+                                    continue
+                                
+                                # Get detailed item information
+                                item_details = self.scrape_item_details(summary['url'])
+                                if not item_details:
+                                    logger.warning(f"Failed to get details for item: {summary['title']}")
+                                    continue
+                                
+                                # Combine summary and details
+                                item_data = {
+                                    **summary,  # Basic info from search page
+                                    **item_details,  # Details from item page
+                                }
+                                
+                                items.append(item_data)
+                                logger.info(f"Successfully processed item: {summary['title']}")
+                                
+                            except Exception as e:
+                                logger.error(f"Error processing item: {str(e)}")
+                                continue
+                        
+                        if items:
+                            logger.info(f"Successfully found {len(items)} valuable items")
+                        else:
+                            logger.info("No valuable items found on this page")
                         break  # Success, exit retry loop
                     else:
-                        logger.info("No valuable items found, but page loaded successfully")
+                        logger.info("No promising items found, but page loaded successfully")
                         break  # No items found, but page loaded correctly
                         
                 elif state == 'no_results':
@@ -890,251 +976,357 @@ class BuyeeScraper:
         
         return items
 
-    def scrape_item_details(self, item_url: str) -> Dict[str, Any]:
-        """
-        Scrape detailed information from an individual item page.
-        Returns a dictionary containing the item's detailed information.
-        """
+    def scrape_item_details(self, item_url: str) -> Optional[Dict[str, Any]]:
+        """Scrape details from an item's detail page."""
+        logger.info(f"STARTED: scrape_item_details() for URL: {item_url}")
         try:
-            # Navigate to the item page
+            # Clear cookies before loading to avoid stale sessions
+            logger.info("Clearing cookies...")
+            self.driver.delete_all_cookies()
+            
+            # Set page load timeout
+            logger.info("Setting page load timeout to 30 seconds...")
+            self.driver.set_page_load_timeout(30)
+            
+            # Load the page
+            logger.info(f"Loading page: {item_url}")
             self.driver.get(item_url)
             
-            # Wait for the page to load
-            WebDriverWait(self.driver, 10).until(
-                EC.presence_of_element_located((By.CSS_SELECTOR, "div.itemDetail"))
-            )
-            
-            details = {}
-            
-            # Extract seller's condition description
+            # Handle cookie popup if present
             try:
-                condition_element = self.driver.find_element(By.CSS_SELECTOR, "div.itemDetail__condition")
-                details['seller_condition'] = condition_element.text.strip()
-                logger.debug(f"Found seller condition: {details['seller_condition']}")
-            except NoSuchElementException:
-                details['seller_condition'] = None
-                logger.warning(f"Could not find seller condition for item: {item_url}")
-            
-            # Extract full item description
-            try:
-                description_element = self.driver.find_element(By.CSS_SELECTOR, "div.itemDetail__description")
-                details['description'] = description_element.text.strip()
-                logger.debug(f"Found description: {details['description'][:200]}...")  # Log first 200 chars
-            except NoSuchElementException:
-                details['description'] = None
-                logger.warning(f"Could not find description for item: {item_url}")
-            
-            # Extract rank if present in description
-            if details.get('description'):
-                rank_match = re.search(r'【ランク】\s*([A-Z]+)', details['description'])
-                if rank_match:
-                    details['rank'] = rank_match.group(1)
-                    logger.debug(f"Found rank: {details['rank']}")
-                else:
-                    details['rank'] = None
-                    logger.debug("No rank found in description")
-            
-            # Extract all images
-            try:
-                # Main image
-                main_img = self.driver.find_element(By.CSS_SELECTOR, "div.itemDetail__image img")
-                details['main_image_url'] = main_img.get_attribute('src')
-                if not details['main_image_url'] or 'spacer.gif' in details['main_image_url']:
-                    data_src = main_img.get_attribute('data-src')
-                    if data_src:
-                        details['main_image_url'] = data_src
+                logger.info("Checking for cookie popup...")
+                cookie_button = WebDriverWait(self.driver, 5).until(
+                    EC.presence_of_element_located((By.ID, "js-accept-cookies"))
+                )
+                logger.info("Found cookie popup, clicking accept...")
+                cookie_button.click()
+            except:
+                logger.info("No cookie popup found or already handled")
                 
-                # Additional images
-                image_elements = self.driver.find_elements(By.CSS_SELECTOR, "div.itemDetail__imageGallery img")
-                details['additional_images'] = []
+            # Wait for either itemDetail_sec or itemDescription as reliable indicators
+            try:
+                logger.info("Waiting for itemDetail_sec or itemDescription...")
+                WebDriverWait(self.driver, 10).until(
+                    EC.presence_of_element_located((By.CSS_SELECTOR, "#itemDetail_sec, #itemDescription"))
+                )
+                logger.info("Found itemDetail_sec or itemDescription")
+            except TimeoutException:
+                logger.warning("Page does not appear to be a valid item page - timeout waiting for itemDetail_sec or itemDescription")
+                self.save_debug_info(item_url.split('/')[-1], "invalid_page", self.driver.page_source)
+                return None
+            
+            # Extract Yahoo Auction ID and URL
+            yahoo_id = None
+            yahoo_url = None
+            try:
+                logger.info("Extracting Yahoo Auction ID and URL...")
+                # First try to get ID from URL
+                yahoo_id_match = re.search(r'/([a-z]\d+)(?:\?|$)', item_url)
+                if yahoo_id_match:
+                    yahoo_id = yahoo_id_match.group(1)
+                    yahoo_url = f"https://page.auctions.yahoo.co.jp/jp/auction/{yahoo_id}"
+                    logger.info(f"Found Yahoo ID from URL: {yahoo_id}")
+                
+                # Then try to get URL from the "View on original site" link
+                logger.info("Looking for 'View on original site' link...")
+                original_site_link = self.driver.find_element(By.CSS_SELECTOR, "div.detail_to_shopping a[target='_blank']")
+                yahoo_url = original_site_link.get_attribute('href')
+                if not yahoo_id and yahoo_url:
+                    yahoo_id = yahoo_url.split('/')[-1]
+                    logger.info(f"Found Yahoo ID from link: {yahoo_id}")
+            except Exception as e:
+                logger.warning(f"Could not find Yahoo Auction link: {str(e)}")
+            
+            # Extract item condition
+            condition = None
+            try:
+                logger.info("Looking for item condition...")
+                condition_element = self.driver.find_element(By.XPATH, "//li[em[contains(text(), 'Item Condition')]]/span")
+                condition = condition_element.text.strip()
+                logger.info(f"Found item condition: {condition}")
+            except Exception as e:
+                logger.warning(f"Could not find item condition: {str(e)}")
+            
+            # Extract description
+            description = None
+            try:
+                logger.info("Looking for item description...")
+                description_element = WebDriverWait(self.driver, 10).until(
+                    EC.presence_of_element_located((By.ID, "auction_item_description"))
+                )
+                description = description_element.text.strip()
+                logger.info(f"Found item description (first 100 chars): {description[:100]}...")
+            except Exception as e:
+                logger.warning(f"Could not find item description: {str(e)}")
+            
+            # Extract main image URL
+            main_image_url = None
+            try:
+                logger.info("Looking for main image...")
+                main_image = self.driver.find_element(By.CSS_SELECTOR, "#itemPhoto_sec .flexslider .slides li:first-child img")
+                main_image_url = main_image.get_attribute('data-src') or main_image.get_attribute('src')
+                logger.info(f"Found main image URL: {main_image_url}")
+            except Exception as e:
+                logger.warning(f"Could not find main image: {str(e)}")
+            
+            # Extract additional images
+            additional_images = []
+            try:
+                logger.info("Looking for additional images...")
+                image_elements = self.driver.find_elements(By.CSS_SELECTOR, "#itemPhoto_sec .flexslider .slides li:not(:first-child) img")
                 for img in image_elements:
-                    img_url = img.get_attribute('src')
-                    if not img_url or 'spacer.gif' in img_url:
-                        data_src = img.get_attribute('data-src')
-                        if data_src:
-                            img_url = data_src
+                    img_url = img.get_attribute('data-src') or img.get_attribute('src')
                     if img_url:
-                        details['additional_images'].append(img_url)
+                        additional_images.append(img_url)
+                logger.info(f"Found {len(additional_images)} additional images")
+            except Exception as e:
+                logger.warning(f"Could not find additional images: {str(e)}")
+            
+            # Validate that we have essential data
+            if not all([yahoo_id, yahoo_url, condition, description, main_image_url]):
+                missing = []
+                if not yahoo_id: missing.append("yahoo_id")
+                if not yahoo_url: missing.append("yahoo_url")
+                if not condition: missing.append("condition")
+                if not description: missing.append("description")
+                if not main_image_url: missing.append("main_image_url")
+                logger.warning(f"Missing essential data: {', '.join(missing)}")
+                self.save_debug_info(item_url.split('/')[-1], "missing_data", self.driver.page_source)
+                return None
                 
-                logger.debug(f"Found {len(details['additional_images']) + 1} images")
-            except NoSuchElementException:
-                details['main_image_url'] = None
-                details['additional_images'] = []
-                logger.warning(f"Could not find images for item: {item_url}")
-            
-            # Extract seller information
-            try:
-                seller_element = self.driver.find_element(By.CSS_SELECTOR, "div.itemDetail__seller")
-                details['seller_name'] = seller_element.text.strip()
-                logger.debug(f"Found seller: {details['seller_name']}")
-            except NoSuchElementException:
-                details['seller_name'] = None
-            
-            # Extract shipping information
-            try:
-                shipping_element = self.driver.find_element(By.CSS_SELECTOR, "div.itemDetail__shipping")
-                details['shipping_info'] = shipping_element.text.strip()
-                logger.debug(f"Found shipping info: {details['shipping_info']}")
-            except NoSuchElementException:
-                details['shipping_info'] = None
-            
-            # Extract time remaining
-            try:
-                time_element = self.driver.find_element(By.CSS_SELECTOR, "div.itemDetail__timeRemaining")
-                details['time_remaining'] = time_element.text.strip()
-                logger.debug(f"Found time remaining: {details['time_remaining']}")
-            except NoSuchElementException:
-                details['time_remaining'] = None
-            
-            # Extract bid count
-            try:
-                bid_element = self.driver.find_element(By.CSS_SELECTOR, "div.itemDetail__bidCount")
-                details['bid_count'] = bid_element.text.strip()
-                logger.debug(f"Found bid count: {details['bid_count']}")
-            except NoSuchElementException:
-                details['bid_count'] = None
-            
-            # Analyze condition using RankAnalyzer
-            rank_analyzer = RankAnalyzer()
-            condition_analysis = rank_analyzer.analyze_condition(
-                details.get('description', ''),
-                details.get('seller_condition', '')
-            )
-            
-            # Add condition analysis results to details
-            details.update({
-                'rank': condition_analysis['rank'],
-                'condition': condition_analysis['condition'].value,
-                'condition_confidence': condition_analysis['confidence'],
-                'condition_indicators': condition_analysis['condition_indicators'],
-                'condition_warnings': condition_analysis['warnings']
-            })
-            
-            logger.info(f"Successfully scraped details for item: {item_url}")
-            return details
+            logger.info("Successfully scraped all item details")
+            return {
+                'yahoo_id': yahoo_id,
+                'yahoo_url': yahoo_url,
+                'condition': condition,
+                'description': description,
+                'main_image_url': main_image_url,
+                'additional_images': additional_images
+            }
             
         except Exception as e:
-            logger.error(f"Error scraping item details for {item_url}: {str(e)}")
-            return {
-                'seller_condition': None,
-                'description': None,
-                'rank': None,
-                'condition': CardCondition.UNKNOWN.value,
-                'condition_confidence': 0.0,
-                'condition_indicators': [],
-                'condition_warnings': [f"Error: {str(e)}"],
-                'main_image_url': None,
-                'additional_images': [],
-                'seller_name': None,
-                'shipping_info': None,
-                'time_remaining': None,
-                'bid_count': None,
-                'error': str(e)
-            }
+            logger.error(f"Error scraping item detail page {item_url}: {str(e)}")
+            self.save_debug_info(item_url.split('/')[-1], "error", self.driver.page_source)
+            return None
 
-    def scrape_items(self) -> List[Dict[str, Any]]:
-        """Scrape items from the current page."""
-        items = []
+    def get_item_summaries_from_search_page(self) -> List[Dict[str, str]]:
+        """Get basic information about all items on the current search page."""
+        summaries = []
+        item_card_selector = "li.itemCard"
         card_analyzer = CardAnalyzer()
         
-        # Define minimum acceptable rank
-        MIN_ACCEPTABLE_RANK = 'A'  # Only consider items with rank A or better
-        
         try:
-            # Get initial count of items
-            item_card_selector = "li.itemCard"
-            logger.debug(f"Attempting to find all item cards with selector: '{item_card_selector}'")
-            
-            item_cards = WebDriverWait(self.driver, 10).until(
+            # Wait for item cards to be present
+            card_elements = WebDriverWait(self.driver, 10).until(
                 EC.presence_of_all_elements_located((By.CSS_SELECTOR, item_card_selector))
             )
-            total_items = len(item_cards)
-            logger.info(f"Found {total_items} item cards using '{item_card_selector}'.")
+            total_items = len(card_elements)
+            logger.info(f"Found {total_items} item cards on search page")
             
-            # Process items by index instead of direct iteration
-            i = 0
-            while i < total_items:
+            # Extract basic info from each card
+            for i, card in enumerate(card_elements):
                 try:
-                    # Re-fetch the current card to avoid stale references
-                    current_cards = self.driver.find_elements(By.CSS_SELECTOR, item_card_selector)
-                    if i >= len(current_cards):
-                        logger.warning(f"Index {i} out of bounds after re-fetching cards. Current count: {len(current_cards)}")
-                        break
+                    # Get title and URL
+                    title_element = card.find_element(By.CSS_SELECTOR, "div.itemCard__itemName a")
+                    title = title_element.text.strip()
+                    url = title_element.get_attribute('href')
                     
-                    card = current_cards[i]
-                    item_data = {}
+                    # Get price
+                    price_element = card.find_element(By.CSS_SELECTOR, "div.g-priceDetails span.g-price")
+                    price_text = price_element.text.strip()
+                    price_yen = self.clean_price(price_text)
                     
-                    # Extract all data from the card as quickly as possible
+                    # Get thumbnail image URL
                     try:
-                        # Title and URL
-                        title_element = card.find_element(By.CSS_SELECTOR, "div.itemCard__itemName a")
-                        item_data['title'] = title_element.text.strip()
-                        item_data['url'] = title_element.get_attribute('href')
-                        
-                        # Price
-                        price_element = card.find_element(By.CSS_SELECTOR, "div.g-priceDetails span.g-price")
-                        raw_price = price_element.text.strip()
-                        item_data['price'] = raw_price
-                        item_data['price_yen'] = self.clean_price(raw_price)
-                        
-                        # Log extracted data for debugging
-                        logger.debug(f"EXTRACTED Card {i+1}/{total_items}: Title='{item_data['title']}', RawPrice='{raw_price}', CleanedPriceYen={item_data['price_yen']}")
-                        
-                        # Get detailed information from the item page
-                        item_details = self.scrape_item_details(item_data['url'])
-                        
-                        # Parse card details from the listing
-                        card_details = self.parse_card_details_from_buyee(item_data['title'], item_details.get('description', ''))
-                        
-                        # Update item data with all the information
-                        item_data.update(item_details)
-                        item_data.update(card_details)
-                        
-                        # Initial filtering based on rank
-                        if item_data.get('rank') and item_data['rank'] >= MIN_ACCEPTABLE_RANK:
-                            logger.debug(f"Card passed rank filter: {item_data['rank']}")
-                            
-                            # Analyze card with CardAnalyzer
-                            card_info = card_analyzer.analyze_card(item_data)
-                            logger.debug(f"Card analysis - Valuable: {card_info.is_valuable}, Confidence: {card_info.confidence_score}")
-                            
-                            # More lenient filtering - only require good condition
-                            if card_info.condition in [CardCondition.MINT, CardCondition.NEAR_MINT, CardCondition.EXCELLENT, CardCondition.VERY_GOOD]:
-                                # Add analysis results to item data
-                                item_data.update({
-                                    'condition': card_info.condition.value,
-                                    'rarity': card_info.rarity,
-                                    'set_code': card_info.set_code,
-                                    'card_number': card_info.card_number,
-                                    'edition': card_info.edition,
-                                    'region': card_info.region,
-                                    'confidence_score': card_info.confidence_score,
-                                    'is_valuable': card_info.is_valuable
-                                })
-                                
-                                items.append(item_data)
-                                logger.info(f"Found valuable card: {card_info.title} ({card_info.condition.value}, {card_info.rarity})")
-                            else:
-                                logger.debug(f"Card failed condition filter - Condition: {card_info.condition.value} not in acceptable range")
-                        else:
-                            logger.debug(f"Card failed rank filter - Rank: {item_data.get('rank', 'None')} below minimum {MIN_ACCEPTABLE_RANK}")
-                        
-                        # If we got here without exceptions, move to next card
-                        i += 1
-                        
-                    except StaleElementReferenceException:
-                        logger.warning(f"StaleElementReferenceException for card at index {i}. Re-fetching card list...")
-                        # Don't increment i, we'll retry this card with fresh elements
-                        continue
-                        
+                        img_element = card.find_element(By.CSS_SELECTOR, "div.itemCard__image img")
+                        thumbnail_url = img_element.get_attribute('data-src') or img_element.get_attribute('src')
+                    except NoSuchElementException:
+                        thumbnail_url = None
+                    
+                    # Log all items before filtering
+                    logger.info(f"Item {i+1}/{total_items}:")
+                    logger.info(f"  Title: {title}")
+                    logger.info(f"  Price: {price_yen} yen")
+                    logger.info(f"  URL: {url}")
+                    
+                    # Quick initial filter based on title and price
+                    preliminary_analysis = card_analyzer.analyze_card({
+                        'title': title,
+                        'price': price_yen,
+                        'url': url,
+                        'image_url': thumbnail_url
+                    })
+                    
+                    # Log analysis results
+                    logger.info(f"  Analysis Results:")
+                    logger.info(f"    Is Valuable: {preliminary_analysis.is_valuable}")
+                    logger.info(f"    Confidence: {preliminary_analysis.confidence_score}")
+                    logger.info(f"    Condition: {preliminary_analysis.condition.value}")
+                    logger.info(f"    Rarity: {preliminary_analysis.rarity}")
+                    logger.info(f"    Set Code: {preliminary_analysis.set_code}")
+                    logger.info(f"    Card Number: {preliminary_analysis.card_number}")
+                    logger.info(f"    Edition: {preliminary_analysis.edition}")
+                    logger.info(f"    Region: {preliminary_analysis.region}")
+                    
+                    # Basic info for all items
+                    card_info = {
+                        'title': title,
+                        'url': url,
+                        'price_text': price_text,
+                        'price_yen': price_yen,
+                        'thumbnail_url': thumbnail_url,
+                        'index': i,
+                        'preliminary_analysis': {
+                            'is_valuable': preliminary_analysis.is_valuable,
+                            'confidence_score': preliminary_analysis.confidence_score,
+                            'condition': preliminary_analysis.condition.value,
+                            'rarity': preliminary_analysis.rarity,
+                            'set_code': preliminary_analysis.set_code,
+                            'card_number': preliminary_analysis.card_number,
+                            'edition': preliminary_analysis.edition,
+                            'region': preliminary_analysis.region
+                        }
+                    }
+                    
+                    # TEMPORARILY: Accept all items for testing
+                    summaries.append(card_info)
+                    logger.info(f"  Added item to summaries (temporarily accepting all items)")
+                    
+                    # Original filtering logic (commented out for testing)
+                    # if preliminary_analysis.is_valuable:
+                    #     summaries.append(card_info)
+                    #     logger.debug(f"Added promising item {i+1}/{total_items}: {title} (Confidence: {preliminary_analysis.confidence_score})")
+                    # else:
+                    #     logger.debug(f"Skipped item {i+1}/{total_items}: {title} (Not valuable)")
+                    
                 except Exception as e:
-                    logger.warning(f"Error processing card at index {i}: {str(e)}")
-                    # Move to next card even if there was an error
-                    i += 1
+                    logger.warning(f"Error extracting summary from card {i+1}: {str(e)}")
+                    continue
+            
+            logger.info(f"Found {len(summaries)} items after initial filtering (temporarily accepting all items)")
+            return summaries
+            
+        except TimeoutException:
+            logger.warning("Timeout waiting for item cards on search page")
+            return []
+        except Exception as e:
+            logger.error(f"Error getting item summaries: {str(e)}")
+            return []
+
+    def scrape_items(self) -> List[Dict[str, Any]]:
+        """Scrape items from the current page using a two-pass approach."""
+        items = []
+        card_analyzer = CardAnalyzer()
+        rank_analyzer = RankAnalyzer()
+        
+        try:
+            # Phase 1: Get all item summaries from the search page
+            logger.info("Phase 1: Collecting item summaries from search page")
+            item_summaries = self.get_item_summaries_from_search_page()
+            if not item_summaries:
+                logger.info("No items found on search page")
+                return items
+            
+            logger.info(f"Found {len(item_summaries)} promising items after initial filtering")
+            
+            # Phase 2: Process each item's detail page
+            logger.info("Phase 2: Processing item detail pages")
+            for summary in item_summaries:
+                try:
+                    logger.info(f"Processing item {summary['index'] + 1}/{len(item_summaries)}: {summary['title']}")
+                    logger.debug(f"Item URL: {summary['url']}")
+                    logger.debug(f"Price: {summary['price_yen']} yen")
+                    logger.debug(f"Preliminary Analysis - Valuable: {summary['preliminary_analysis']['is_valuable']}, "
+                               f"Confidence: {summary['preliminary_analysis']['confidence_score']}")
+                    
+                    # Skip items with low confidence scores
+                    if summary['preliminary_analysis']['confidence_score'] < 0.3:
+                        logger.info(f"Skipping item - Low confidence score: {summary['preliminary_analysis']['confidence_score']}")
+                        continue
+                    
+                    # Step 1: Get detailed item information
+                    item_details = self.scrape_item_details(summary['url'])
+                    if not item_details:
+                        logger.warning(f"Failed to get details for item: {summary['title']}")
+                        continue
+                    
+                    # Step 2: Analyze condition
+                    condition_analysis = rank_analyzer.analyze_condition(
+                        item_details.get('description', ''),
+                        item_details.get('seller_condition', '')
+                    )
+                    
+                    # Define acceptable conditions
+                    acceptable_conditions = {
+                        CardCondition.MINT,
+                        CardCondition.NEAR_MINT,
+                        CardCondition.EXCELLENT
+                    }
+                    
+                    logger.debug(f"Condition analysis - Rank: {condition_analysis['rank_from_description']}, "
+                               f"Condition: {condition_analysis['condition'].value}, "
+                               f"Confidence: {condition_analysis['confidence']}")
+                    
+                    if condition_analysis['condition'] not in acceptable_conditions:
+                        logger.info(f"Skipping item - Condition not acceptable: {condition_analysis['condition'].value}")
+                        continue
+                    
+                    # Step 3: Parse card details
+                    card_details = self.parse_card_details_from_buyee(summary['title'], item_details.get('description', ''))
+                    
+                    logger.debug(f"Parsed card details - Set: {card_details.get('set_code', 'None')}, "
+                               f"Number: {card_details.get('card_number', 'None')}, "
+                               f"Rarity: {card_details.get('rarity', 'None')}")
+                    
+                    # Step 4: Analyze card value with full information
+                    card_info = card_analyzer.analyze_card({
+                        'title': summary['title'],
+                        'description': item_details.get('description', ''),
+                        'price': summary['price_yen'],
+                        'set_code': card_details.get('set_code'),
+                        'card_number': card_details.get('card_number'),
+                        'rarity': card_details.get('rarity'),
+                        'edition': card_details.get('edition'),
+                        'region': card_details.get('language')
+                    })
+                    
+                    logger.info(f"Card Analysis - Valuable: {card_info.is_valuable}, "
+                              f"Confidence: {card_info.confidence_score}, "
+                              f"Condition: {card_info.condition.value}")
+                    
+                    if not card_info.is_valuable:
+                        logger.info(f"Skipping item - Not identified as valuable card")
+                        continue
+                    
+                    # If we get here, the item has passed all filters
+                    # Combine all information
+                    item_data = {
+                        **summary,  # Basic info from search page
+                        **item_details,  # Details from item page
+                        **card_details,  # Parsed card details
+                        'card_analysis': {
+                            'is_valuable': card_info.is_valuable,
+                            'confidence_score': card_info.confidence_score,
+                            'condition': card_info.condition.value,
+                            'rarity': card_info.rarity,
+                            'set_code': card_info.set_code,
+                            'card_number': card_info.card_number,
+                            'edition': card_info.edition,
+                            'region': card_info.region
+                        },
+                        'condition_analysis': condition_analysis
+                    }
+                    
+                    items.append(item_data)
+                    logger.info(f"Found valuable card: {card_info.title} "
+                              f"({card_info.condition.value}, {card_info.rarity})")
+                    
+                except Exception as e:
+                    logger.error(f"Error processing item {summary['index'] + 1}: {str(e)}")
                     continue
             
             if items:
-                logger.info(f"Successfully scraped {len(items)} valuable items")
+                logger.info(f"Successfully found {len(items)} valuable items")
             else:
                 logger.info("No valuable items found on this page")
             
@@ -1274,6 +1466,112 @@ class BuyeeScraper:
         except Exception as e:
             logger.error(f"Error parsing card details: {str(e)}")
             return details
+
+    def scrape_item_detail_page(self, url):
+        """Scrape details from an item's detail page."""
+        try:
+            # Clear cookies before loading to avoid stale sessions
+            self.driver.delete_all_cookies()
+            
+            # Set page load timeout
+            self.driver.set_page_load_timeout(30)
+            
+            # Load the page
+            self.driver.get(url)
+            
+            # Handle cookie popup if present
+            try:
+                cookie_button = WebDriverWait(self.driver, 5).until(
+                    EC.presence_of_element_located((By.ID, "js-accept-cookies"))
+                )
+                cookie_button.click()
+            except:
+                pass  # Cookie popup may not appear
+                
+            # Wait for either itemDetail_sec or itemDescription as reliable indicators
+            try:
+                WebDriverWait(self.driver, 10).until(
+                    EC.presence_of_element_located((By.CSS_SELECTOR, "#itemDetail_sec, #itemDescription"))
+                )
+            except TimeoutException:
+                self.logger.warning("Page does not appear to be a valid item page")
+                self.save_debug_info(url.split('/')[-1], "invalid_page", self.driver.page_source)
+                return None
+            
+            # Extract Yahoo Auction ID and URL
+            yahoo_id = None
+            yahoo_url = None
+            try:
+                # First try to get ID from URL
+                yahoo_id_match = re.search(r'/([a-z]\d+)(?:\?|$)', url)
+                if yahoo_id_match:
+                    yahoo_id = yahoo_id_match.group(1)
+                    yahoo_url = f"https://page.auctions.yahoo.co.jp/jp/auction/{yahoo_id}"
+                
+                # Then try to get URL from the "View on original site" link
+                original_site_link = self.driver.find_element(By.CSS_SELECTOR, "div.detail_to_shopping a[target='_blank']")
+                yahoo_url = original_site_link.get_attribute('href')
+                if not yahoo_id and yahoo_url:
+                    yahoo_id = yahoo_url.split('/')[-1]
+            except:
+                self.logger.warning(f"Could not find Yahoo Auction link for {url}")
+            
+            # Extract item condition
+            condition = None
+            try:
+                condition_element = self.driver.find_element(By.XPATH, "//li[em[contains(text(), 'Item Condition')]]/span")
+                condition = condition_element.text.strip()
+            except:
+                self.logger.warning(f"Could not find item condition for {url}")
+            
+            # Extract description
+            description = None
+            try:
+                description_element = WebDriverWait(self.driver, 10).until(
+                    EC.presence_of_element_located((By.ID, "auction_item_description"))
+                )
+                description = description_element.text.strip()
+            except:
+                self.logger.warning(f"Could not find item description for {url}")
+            
+            # Extract main image URL
+            main_image_url = None
+            try:
+                main_image = self.driver.find_element(By.CSS_SELECTOR, "#itemPhoto_sec .flexslider .slides li:first-child img")
+                main_image_url = main_image.get_attribute('data-src') or main_image.get_attribute('src')
+            except:
+                self.logger.warning(f"Could not find main image for {url}")
+            
+            # Extract additional images
+            additional_images = []
+            try:
+                image_elements = self.driver.find_elements(By.CSS_SELECTOR, "#itemPhoto_sec .flexslider .slides li:not(:first-child) img")
+                for img in image_elements:
+                    img_url = img.get_attribute('data-src') or img.get_attribute('src')
+                    if img_url:
+                        additional_images.append(img_url)
+            except:
+                self.logger.warning(f"Could not find additional images for {url}")
+            
+            # Validate that we have essential data
+            if not all([yahoo_id, yahoo_url, condition, description, main_image_url]):
+                self.logger.warning(f"Missing essential data for {url}")
+                self.save_debug_info(url.split('/')[-1], "missing_data", self.driver.page_source)
+                return None
+                
+            return {
+                'yahoo_id': yahoo_id,
+                'yahoo_url': yahoo_url,
+                'condition': condition,
+                'description': description,
+                'main_image_url': main_image_url,
+                'additional_images': additional_images
+            }
+            
+        except Exception as e:
+            self.logger.error(f"Error scraping item detail page {url}: {str(e)}")
+            self.save_debug_info(url.split('/')[-1], "error", self.driver.page_source)
+            return None
 
 def main():
     parser = argparse.ArgumentParser(description='Scrape Buyee for Yu-Gi-Oh cards')
