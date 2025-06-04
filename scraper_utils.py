@@ -22,6 +22,7 @@ class RequestHandler:
     """Handles HTTP requests with retry logic and bot detection."""
     
     def __init__(self):
+        """Initialize the RequestHandler with default headers and retry settings."""
         self.session = requests.Session()
         self.session.headers.update({
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -29,46 +30,70 @@ class RequestHandler:
             'Accept-Language': 'ja,en-US;q=0.9,en;q=0.8',
         })
         self.retry_delays = [1, 2, 5, 10, 30]  # Exponential backoff delays
-    
-    def get_page(self, url: str, max_retries: int = 3) -> Optional[str]:
-        """Make a request with retry logic and bot detection."""
-        for retry in range(max_retries):
+        self.max_retries = 3
+        self.timeout = 10
+        
+    def get_page(self, url: str, max_retries: int = None, timeout: int = None) -> Optional[str]:
+        """
+        Make a request with retry logic and bot detection.
+        
+        Args:
+            url (str): URL to fetch
+            max_retries (int): Maximum number of retries
+            timeout (int): Request timeout in seconds
+            
+        Returns:
+            Optional[str]: Page content or None if failed
+        """
+        retries = max_retries if max_retries is not None else self.max_retries
+        timeout = timeout if timeout is not None else self.timeout
+        
+        for retry in range(retries):
             try:
+                # Add random delay between requests
                 time.sleep(random.uniform(3, 7))
-                response = self.session.get(url, timeout=10)
                 
+                # Make request with timeout
+                response = self.session.get(url, timeout=timeout)
+                
+                # Handle common error cases
                 if response.status_code == 404:
                     logger.warning(f"Item not found (404): {url}")
                     return None
                 
                 if response.status_code in [403, 429]:
                     logger.warning(f"Bot detection triggered (HTTP {response.status_code})")
-                    if retry < max_retries - 1:
+                    if retry < retries - 1:
                         delay = self.retry_delays[min(retry, len(self.retry_delays) - 1)]
                         logger.info(f"Waiting {delay} seconds before retry...")
                         time.sleep(delay)
                         continue
                     return None
                 
+                # Check for Japanese-specific error messages
                 if 'このサービスは日本国内からのみご利用いただけます' in response.text:
                     logger.error("Access denied. This service is only available from Japan.")
                     return None
                 
                 if 'アクセスが集中' in response.text or '一時的なアクセス制限' in response.text:
                     logger.warning("Bot challenge page detected")
-                    if retry < max_retries - 1:
+                    if retry < retries - 1:
                         delay = self.retry_delays[min(retry, len(self.retry_delays) - 1)]
                         logger.info(f"Waiting {delay} seconds before retry...")
                         time.sleep(delay)
                         continue
                     return None
                 
+                # Raise for any other HTTP errors
                 response.raise_for_status()
+                
+                # Log successful request
+                logger.info(f"Successfully fetched page: {url}")
                 return response.text
                 
             except requests.RequestException as e:
                 logger.error(f"Error fetching {url}: {str(e)}")
-                if retry < max_retries - 1:
+                if retry < retries - 1:
                     delay = self.retry_delays[min(retry, len(self.retry_delays) - 1)]
                     logger.info(f"Waiting {delay} seconds before retry...")
                     time.sleep(delay)

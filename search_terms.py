@@ -15,23 +15,23 @@ SEARCH_TERMS = [
     "青眼の白龍",  # Blue-Eyes White Dragon
     "アマダ 遊戯王",  # Amada Yu-Gi-Oh
     
-    # Magic: The Gathering
-    "magic the gathering",
+    # # Magic: The Gathering
+    # "magic the gathering",
     
-    # Pokemon related terms
-    "ポケモンカード",  # Pokemon cards
-    "ポケモン キッズ カード",  # Pokemon Kids cards
-    "ポケモンカード カードダス",  # Pokemon Carddass
-    "ポケモンカード スターター",  # Pokemon starter cards
-    "ポケモンシール",  # Pokemon seals
+    # # Pokemon related terms
+    # "ポケモンカード",  # Pokemon cards
+    # "ポケモン キッズ カード",  # Pokemon Kids cards
+    # "ポケモンカード カードダス",  # Pokemon Carddass
+    # "ポケモンカード スターター",  # Pokemon starter cards
+    # "ポケモンシール",  # Pokemon seals
     
-    # Digimon related terms
-    "デジモンカード",  # Digimon cards
-    "デジモン",  # Digimon general
+    # # Digimon related terms
+    # "デジモンカード",  # Digimon cards
+    # "デジモン",  # Digimon general
     
-    # Dragon Ball related terms
-    "ドラゴンボールカード",  # Dragon Ball cards
+    # # Dragon Ball related terms
+    # "ドラゴンボールカード",  # Dragon Ball cards
     
-    # Other popular series
-    "鬼滅の刃"  # Demon Slayer
+    # # Other popular series
+    # "鬼滅の刃"  # Demon Slayer
 ] 

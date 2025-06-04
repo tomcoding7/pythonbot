@@ -52,24 +52,108 @@ if not api_key:
 
 class BuyeeScraper:
     def __init__(self, output_dir: str = "scraped_results", max_pages: int = 5, headless: bool = True):
+        """
+        Initialize the BuyeeScraper with configuration options.
+        
+        Args:
+            output_dir (str): Directory to save scraped data
+            max_pages (int): Maximum number of pages to scrape per search
+            headless (bool): Run Chrome in headless mode
+        """
         self.base_url = "https://buyee.jp"
         self.output_dir = output_dir
         self.max_pages = max_pages
         self.headless = headless
+        self.driver = None
+        self.request_handler = RequestHandler()
+        self.card_analyzer = CardAnalyzer()
+        self.rank_analyzer = RankAnalyzer()
+        
         os.makedirs(self.output_dir, exist_ok=True)
         self.setup_driver()
+        
+    def __enter__(self):
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.cleanup()
+        
+    def cleanup(self):
+        """Clean up resources and close the driver."""
+        if self.driver:
+            try:
+                self.driver.quit()
+            except Exception as e:
+                logger.error(f"Error during driver cleanup: {str(e)}")
+            self.driver = None
+            
+    def setup_driver(self):
+        """Set up and configure Chrome WebDriver with stealth mode."""
+        try:
+            chrome_options = Options()
+            
+            # Basic options
+            chrome_options.add_argument('--no-sandbox')
+            chrome_options.add_argument('--disable-dev-shm-usage')
+            
+            # Stealth mode configuration
+            chrome_options.add_argument('--disable-blink-features=AutomationControlled')
+            chrome_options.add_experimental_option('excludeSwitches', ['enable-automation'])
+            chrome_options.add_experimental_option('useAutomationExtension', False)
+            
+            if self.headless:
+                chrome_options.add_argument('--headless=new')
+            
+            # Set up service
+            service = Service(ChromeDriverManager().install())
+            
+            # Initialize driver
+            self.driver = webdriver.Chrome(service=service, options=chrome_options)
+            
+            # Apply stealth mode
+            stealth(
+                self.driver,
+                languages=["ja-JP", "ja"],
+                vendor="Google Inc.",
+                platform="Win32",
+                webgl_vendor="Intel Inc.",
+                renderer="Intel Iris OpenGL Engine",
+                fix_hairline=True,
+            )
+            
+            logger.info("WebDriver initialized successfully")
+            
+        except Exception as e:
+            logger.error(f"Failed to setup WebDriver: {str(e)}")
+            raise
 
     def sanitize_filename(self, filename: str) -> str:
-        """Sanitize a string to be used as a valid filename on Windows."""
-        # Replace invalid characters with underscores
-        invalid_chars = r'[<>:"/\\|?*]'
-        sanitized = re.sub(invalid_chars, '_', filename)
-        # Remove any leading/trailing spaces and dots
-        sanitized = sanitized.strip('. ')
-        # Ensure the filename isn't too long (Windows has a 255 character limit)
-        if len(sanitized) > 240:  # Leave room for extension
-            sanitized = sanitized[:240]
-        return sanitized
+        """
+        Sanitize a string to be used as a valid filename on Windows.
+        
+        Args:
+            filename (str): Original filename to sanitize
+            
+        Returns:
+            str: Sanitized filename
+        """
+        try:
+            # Replace invalid characters with underscores
+            invalid_chars = r'[<>:"/\\|?*]'
+            sanitized = re.sub(invalid_chars, '_', filename)
+            
+            # Remove any leading/trailing spaces and dots
+            sanitized = sanitized.strip('. ')
+            
+            # Ensure the filename isn't too long (Windows has a 255 character limit)
+            if len(sanitized) > 240:  # Leave room for extension
+                sanitized = sanitized[:240]
+                
+            return sanitized
+            
+        except Exception as e:
+            logger.error(f"Error sanitizing filename: {str(e)}")
+            return f"invalid_filename_{hash(filename)}"
 
     def save_debug_info(self, identifier: str, error_type: str, page_source: str) -> None:
         """Save debug information about a failed request."""
