@@ -1,744 +1,393 @@
-from bs4 import BeautifulSoup
-import re
-import logging
-from typing import List, Dict, Optional, Any
+from selenium import webdriver
+from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.common.by import By
+from selenium.common.exceptions import TimeoutException, NoSuchElementException
 import time
-import os
-import csv
 import json
+import os
+import logging
+from typing import List, Dict, Any, Optional
 from datetime import datetime
+from .card_analyzer2 import CardAnalyzer, CardInfo
+from .rank_analyzer import RankAnalyzer
+from .text_analyzer import TextAnalyzer
+from .image_analyzer import ImageAnalyzer
+from .deal_analyzer import DealAnalyzer
+
+logger = logging.getLogger(__name__)
 
 class BuyeeScraper:
     def __init__(self, headless: bool = True):
-        # ... existing code ...
+        self.setup_logging()
+        self.setup_driver(headless)
+        self.card_analyzer = CardAnalyzer()
+        self.rank_analyzer = RankAnalyzer()
+        self.text_analyzer = TextAnalyzer()
+        self.image_analyzer = ImageAnalyzer()
+        self.deal_analyzer = DealAnalyzer()
+        self.setup_directories()
         
-        # Search URL parameters
-        self.search_params = {
-            'sort': 'bids',  # Default to highest bid
-            'order': 'd',    # Descending order
-            'ranking': None, # Will be set to 'popular' if using popularity sort
-            'translationType': '98',
-            'page': '1'
-        }
-
-    def search_items(self, 
-                    query: str,
-                    sort_by: str = 'bids',  # 'bids' or 'popular'
-                    max_pages: int = 1) -> List[Dict[str, Any]]:
-        """
-        Search for items on Buyee.
+    def setup_logging(self):
+        """Set up logging configuration."""
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+            handlers=[
+                logging.FileHandler('scraper.log'),
+                logging.StreamHandler()
+            ]
+        )
         
-        Args:
-            query: Search query string
-            sort_by: Sort method ('bids' for highest bid or 'popular' for most popular)
-            max_pages: Maximum number of pages to scrape
-        """
-        all_items = []
+    def setup_driver(self, headless: bool):
+        """Set up the Selenium WebDriver with appropriate options."""
+        options = webdriver.ChromeOptions()
+        if headless:
+            options.add_argument('--headless')
+        options.add_argument('--no-sandbox')
+        options.add_argument('--disable-dev-shm-usage')
+        options.add_argument('--disable-gpu')
+        options.add_argument('--window-size=1920,1080')
+        options.add_argument('--disable-blink-features=AutomationControlled')
+        options.add_experimental_option("excludeSwitches", ["enable-automation"])
+        options.add_experimental_option('useAutomationExtension', False)
         
-        # Update search parameters
-        self.search_params['sort'] = sort_by
-        if sort_by == 'popular':
-            self.search_params['ranking'] = 'popular'
-            self.search_params['order'] = None  # Remove order parameter for popularity sort
-        else:
-            self.search_params['ranking'] = None
-            self.search_params['order'] = 'd'  # Descending order for bid sort
+        self.driver = webdriver.Chrome(options=options)
+        self.driver.execute_cdp_cmd('Network.setUserAgentOverride', {
+            "userAgent": 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        })
         
-        for page in range(1, max_pages + 1):
-            self.search_params['page'] = str(page)
+    def setup_directories(self):
+        """Create necessary directories for saving results."""
+        os.makedirs('scraped_results', exist_ok=True)
+        os.makedirs('scraped_results/debug', exist_ok=True)
+        os.makedirs('scraped_results/initial_leads', exist_ok=True)
+        os.makedirs('scraped_results/final_gems', exist_ok=True)
+        
+    def search_items(self, search_terms: List[str], max_pages: int = 3):
+        """Search for items using the provided search terms."""
+        all_initial_leads = []
+        
+        for term in search_terms:
+            logger.info(f"Processing search term: {term}")
+            initial_leads = self.process_search_term(term, max_pages)
+            all_initial_leads.extend(initial_leads)
             
-            # Construct search URL
-            search_url = f"https://buyee.jp/item/search/query/{quote(query)}"
-            params = {k: v for k, v in self.search_params.items() if v is not None}
-            search_url += '?' + '&'.join(f"{k}={v}" for k, v in params.items())
-            
-            logging.info(f"Searching page {page} with URL: {search_url}")
-            
-            try:
-                self.driver.get(search_url)
-                WebDriverWait(self.driver, 10).until(
-                    EC.presence_of_element_located((By.CSS_SELECTOR, "div[class*='itemCard']"))
-                )
+            # Save initial leads for this term
+            if initial_leads:
+                self.save_initial_leads(term, initial_leads)
                 
-                # Get all item cards
-                item_cards = self.driver.find_elements(By.CSS_SELECTOR, "div[class*='itemCard']")
-                logging.info(f"Found {len(item_cards)} items on page {page}")
-                
-                for card in item_cards:
-                    try:
-                        # Extract item data
-                        item_data = self._extract_item_data(card)
-                        if item_data:
-                            all_items.append(item_data)
-                    except Exception as e:
-                        logging.error(f"Error processing item card: {str(e)}")
-                        continue
-                
-            except Exception as e:
-                logging.error(f"Error searching page {page}: {str(e)}")
-                break
+        return all_initial_leads
         
-        return all_items
-
-    def _extract_item_data(self, card) -> Optional[Dict[str, Any]]:
-        """Extract data from an item card."""
+    def process_search_term(self, term: str, max_pages: int) -> List[Dict[str, Any]]:
+        """Process a single search term and return initial leads."""
+        initial_leads = []
+        
         try:
-            # ... existing code ...
+            # Navigate to search page
+            search_url = f"https://buyee.jp/item/search/query/{term}"
+            self.driver.get(search_url)
             
-            # Extract bid count and popularity score if available
-            bid_count = None
-            popularity_score = None
+            # Handle cookie popup if present
+            self.handle_cookie_popup()
             
-            try:
-                bid_element = card.find_element(By.CSS_SELECTOR, "span[class*='bidCount']")
-                bid_count = int(bid_element.text.strip())
-            except:
-                pass
+            # Process each page
+            for page in range(1, max_pages + 1):
+                logger.info(f"Processing page {page} for term: {term}")
                 
-            try:
-                score_element = card.find_element(By.CSS_SELECTOR, "span[class*='score']")
-                popularity_score = int(score_element.text.strip())
-            except:
-                pass
-            
-            return {
-                'title': title,
-                'price_text': price_text,
-                'price': price,
-                'url': url,
-                'image_url': image_url,
-                'bid_count': bid_count,
-                'popularity_score': popularity_score
-            }
-            
+                # Wait for items to load
+                try:
+                    WebDriverWait(self.driver, 10).until(
+                        EC.presence_of_element_located((By.CSS_SELECTOR, "div.itemCard"))
+                    )
+                except TimeoutException:
+                    logger.warning(f"No items found on page {page} for term: {term}")
+                    break
+                    
+                # Get item summaries
+                item_summaries = self.get_item_summaries_from_search_page()
+                
+                # Analyze each item
+                for item in item_summaries:
+                    try:
+                        # Get detailed information
+                        detail_data = self.scrape_item_detail_page(item['url'])
+                        if detail_data:
+                            item.update(detail_data)
+                        
+                        # Perform AI analysis
+                        card_info = self.card_analyzer.analyze_card(item)
+                        
+                        # If item looks promising, add to initial leads
+                        if card_info.is_valuable and card_info.confidence_score >= 0.7:
+                            item['card_info'] = card_info
+                            item['analysis'] = {
+                                'estimated_value': card_info.estimated_value,
+                                'profit_potential': card_info.profit_potential,
+                                'recommendation': card_info.recommendation
+                            }
+                            initial_leads.append(item)
+                            logger.info(f"Found promising lead: {item['title']}")
+                            logger.info(f"Estimated value: ¥{card_info.estimated_value['min']}-¥{card_info.estimated_value['max']}")
+                            logger.info(f"Profit potential: ¥{card_info.profit_potential}")
+                            logger.info(f"Recommendation: {card_info.recommendation}")
+                            
+                    except Exception as e:
+                        logger.error(f"Error analyzing item: {str(e)}")
+                        continue
+                        
+                # Try to go to next page
+                if not self.go_to_next_page():
+                    break
+                    
         except Exception as e:
-            logging.error(f"Error extracting item data: {str(e)}")
-            return None
-
-    def get_item_summaries_from_search_page(self, html_content: str) -> List[Dict]:
-        """Extract item summaries from a search page."""
-        soup = BeautifulSoup(html_content, 'html.parser')
+            logger.error(f"Error processing search term {term}: {str(e)}")
+            
+        return initial_leads
+        
+    def get_item_summaries_from_search_page(self) -> List[Dict[str, Any]]:
+        """Extract item summaries from the current search page."""
         items = []
         
-        # Find all item containers
-        item_containers = soup.find_all('div', class_='item-card')
-        
-        for container in item_containers:
-            try:
-                # Extract basic information
-                title_elem = container.find('div', class_='item-card__title')
-                price_elem = container.find('div', class_='item-card__price')
-                link_elem = container.find('a', class_='item-card__link')
-                
-                if not all([title_elem, price_elem, link_elem]):
-                    continue
-                
-                title = title_elem.get_text(strip=True)
-                price_text = price_elem.get_text(strip=True)
-                link = link_elem.get('href', '')
-                
-                # Extract price value
-                price_match = re.search(r'[\d,]+', price_text)
-                if not price_match:
-                    continue
+        try:
+            # Find all item cards
+            item_cards = self.driver.find_elements(By.CSS_SELECTOR, "div.itemCard")
+            
+            for card in item_cards:
+                try:
+                    # Extract basic information
+                    title = card.find_element(By.CSS_SELECTOR, "div.itemCard__title").text
+                    price_text = card.find_element(By.CSS_SELECTOR, "div.itemCard__price").text
+                    price = self.extract_price(price_text)
                     
-                price = int(price_match.group().replace(',', ''))
-                
-                # Skip if price is too high
-                if price > self.max_price:
-                    continue
-                
-                # Analyze title for valuable keywords
-                title_lower = title.lower()
-                confidence = 0.0
-                matched_keywords = []
-                
-                # Yu-Gi-Oh! specific keywords
-                yugioh_keywords = [
-                    '遊戯王', 'yugioh', 'yu-gi-oh', 'yu gi oh',
-                    '青眼', 'blue-eyes', 'blue eyes',
-                    'ブラック・マジシャン', 'black magician', 'dark magician',
-                    'レッドアイズ', 'red-eyes', 'red eyes',
-                    'エクゾディア', 'exodia',
-                    'カオス', 'chaos',
-                    'サイバー', 'cyber',
-                    'エレメンタル・ヒーロー', 'elemental hero',
-                    'デステニー・ヒーロー', 'destiny hero',
-                    'ネオス', 'neos',
-                    'スターダスト', 'stardust',
-                    'ブラックローズ', 'black rose',
-                    'アーカナイト', 'arcanite',
-                    'シンクロ', 'synchro',
-                    'エクシーズ', 'xyz',
-                    'リンク', 'link',
-                    'ペンデュラム', 'pendulum',
-                    '融合', 'fusion',
-                    '儀式', 'ritual',
-                    '効果', 'effect',
-                    '通常', 'normal',
-                    '永続', 'continuous',
-                    '速攻', 'quick-play',
-                    '罠', 'trap',
-                    '魔法', 'spell',
-                    'モンスター', 'monster',
-                    'カード', 'card',
-                    'トレカ', 'trading card',
-                    'レア', 'rare',
-                    'スーパーレア', 'super rare',
-                    'ウルトラレア', 'ultra rare',
-                    'シークレットレア', 'secret rare',
-                    'アルティメットレア', 'ultimate rare',
-                    'ゴールドレア', 'gold rare',
-                    'プラチナレア', 'platinum rare',
-                    'パラレルレア', 'parallel rare',
-                    'コレクターズレア', 'collector\'s rare',
-                    'クォーターセンチュリー', 'quarter century',
-                    '1st', 'first edition', '初版',
-                    '限定', 'limited',
-                    '特典', 'promo',
-                    '大会', 'tournament',
-                    'イベント', 'event',
-                    'チャンピオンシップ', 'championship'
-                ]
-                
-                # Check for Yu-Gi-Oh! keywords
-                for keyword in yugioh_keywords:
-                    if keyword.lower() in title_lower:
-                        confidence += 0.1  # Small boost for each keyword match
-                        matched_keywords.append(keyword)
-                
-                # Check for set codes (e.g., LOB-001, MRD-060)
-                set_code_match = re.search(r'([A-Z]{2,4})-(\d{3})', title)
-                if set_code_match:
-                    confidence += 0.3  # Significant boost for set code
-                    matched_keywords.append(set_code_match.group(0))
-                
-                # Check for condition keywords
-                condition_keywords = {
-                    'mint': ['mint', 'ミント'],
-                    'near mint': ['near mint', 'nm', 'ニアミント'],
-                    'excellent': ['excellent', 'ex', 'エクセレント'],
-                    'good': ['good', 'gd', 'グッド'],
-                    'light played': ['light played', 'lp', 'ライトプレイ'],
-                    'played': ['played', 'pl', 'プレイ'],
-                    'poor': ['poor', 'pr', 'プア']
-                }
-                
-                for condition, keywords in condition_keywords.items():
-                    if any(keyword.lower() in title_lower for keyword in keywords):
-                        confidence += 0.2
-                        matched_keywords.append(condition)
-                
-                # Check for rarity keywords
-                rarity_keywords = {
-                    'common': ['common', 'コモン'],
-                    'rare': ['rare', 'レア'],
-                    'super rare': ['super rare', 'sr', 'スーパーレア'],
-                    'ultra rare': ['ultra rare', 'ur', 'ウルトラレア'],
-                    'secret rare': ['secret rare', 'scr', 'シークレットレア'],
-                    'ultimate rare': ['ultimate rare', 'utr', 'アルティメットレア'],
-                    'ghost rare': ['ghost rare', 'gr', 'ゴーストレア'],
-                    'platinum rare': ['platinum rare', 'plr', 'プラチナレア'],
-                    'gold rare': ['gold rare', 'gld', 'ゴールドレア'],
-                    'parallel rare': ['parallel rare', 'pr', 'パラレルレア'],
-                    'collector\'s rare': ['collector\'s rare', 'cr', 'コレクターズレア'],
-                    'quarter century': ['quarter century', 'qc', 'クォーターセンチュリー']
-                }
-                
-                for rarity, keywords in rarity_keywords.items():
-                    if any(keyword.lower() in title_lower for keyword in keywords):
-                        confidence += 0.2
-                        matched_keywords.append(rarity)
-                
-                # Check for edition keywords
-                edition_keywords = {
-                    '1st edition': ['1st', 'first edition', '初版'],
-                    'unlimited': ['unlimited', '無制限', '再版']
-                }
-                
-                for edition, keywords in edition_keywords.items():
-                    if any(keyword.lower() in title_lower for keyword in keywords):
-                        confidence += 0.15
-                        matched_keywords.append(edition)
-                
-                # Check for region keywords
-                region_keywords = {
-                    'asia': ['asia', 'asian', 'アジア', 'アジア版'],
-                    'english': ['english', '英', '英語版'],
-                    'japanese': ['japanese', '日', '日本語版'],
-                    'korean': ['korean', '韓', '韓国版']
-                }
-                
-                for region, keywords in region_keywords.items():
-                    if any(keyword.lower() in title_lower for keyword in keywords):
-                        confidence += 0.15
-                        matched_keywords.append(region)
-                
-                # Log detailed information about the item
-                logging.info(f"\nAnalyzing item: {title}")
-                logging.info(f"Price: {price}")
-                logging.info(f"Matched keywords: {', '.join(matched_keywords)}")
-                logging.info(f"Confidence score: {confidence:.2f}")
-                
-                # Lower confidence threshold to 0.1 (from 0.2)
-                if confidence >= 0.1:
+                    # Get item URL
+                    item_url = card.find_element(By.CSS_SELECTOR, "a.itemCard__titleLink").get_attribute("href")
+                    
+                    # Get thumbnail image URL
+                    try:
+                        img = card.find_element(By.CSS_SELECTOR, "img.itemCard__image")
+                        image_url = img.get_attribute("src")
+                    except NoSuchElementException:
+                        image_url = None
+                        
                     items.append({
                         'title': title,
                         'price': price,
-                        'link': link,
-                        'confidence': confidence,
-                        'matched_keywords': matched_keywords
+                        'price_text': price_text,
+                        'url': item_url,
+                        'image_url': image_url
                     })
-                    logging.info("Item ACCEPTED")
-                else:
-                    logging.info("Item REJECTED - Low confidence")
-                
-            except Exception as e:
-                logging.error(f"Error processing item: {str(e)}")
-                continue
+                    
+                except Exception as e:
+                    logger.error(f"Error extracting item summary: {str(e)}")
+                    continue
+                    
+        except Exception as e:
+            logger.error(f"Error getting item summaries: {str(e)}")
+            
+        return items
         
-        return items 
-
-    def scrape_item_detail_page(self, html_content: str) -> Optional[Dict]:
-        """Scrape detailed information from an item's detail page."""
+    def scrape_item_detail_page(self, item_url: str) -> Optional[Dict[str, Any]]:
+        """Scrape detailed information from an item's page."""
         try:
-            soup = BeautifulSoup(html_content, 'html.parser')
+            # Add delay to avoid rate limiting
+            time.sleep(3)
             
-            # Save debug HTML
-            debug_dir = "debug_html"
-            os.makedirs(debug_dir, exist_ok=True)
-            debug_file = os.path.join(debug_dir, f"detail_page_{int(time.time())}.html")
-            with open(debug_file, "w", encoding="utf-8") as f:
-                f.write(html_content)
+            # Load the item page
+            self.driver.get(item_url)
             
-            # Log the HTML structure for debugging
-            logging.info("\nAnalyzing detail page structure:")
-            logging.info(f"Title elements found: {len(soup.find_all(['h1', 'h2', 'h3']))}")
-            logging.info(f"Description elements found: {len(soup.find_all(['div', 'section'], class_=lambda x: x and ('description' in x.lower() or 'detail' in x.lower() or 'content' in x.lower())))}")
-            logging.info(f"Price elements found: {len(soup.find_all(['span', 'div'], class_=lambda x: x and ('price' in x.lower() or 'amount' in x.lower())))}")
-            
-            # Try multiple selectors for title (Buyee specific)
-            title = None
-            title_selectors = [
-                'h1.item-name',
-                'div.item-name',
-                'h1[class*="item-name"]',
-                'div[class*="item-name"]',
-                'h1[class*="title"]',
-                'div[class*="title"]',
-                'h1[class*="product"]',
-                'div[class*="product"]',
-                'h1[class*="auction"]',
-                'div[class*="auction"]',
-                'h1[class*="item-title"]',
-                'div[class*="item-title"]',
-                'h1[class*="product-title"]',
-                'div[class*="product-title"]',
-                'h1[class*="auction-title"]',
-                'div[class*="auction-title"]'
-            ]
-            
-            for selector in title_selectors:
-                title_elem = soup.select_one(selector)
-                if title_elem:
-                    title = title_elem.get_text(strip=True)
-                    logging.info(f"Found title using selector '{selector}': {title}")
-                    break
-            
-            if not title:
-                logging.warning("Could not find title element")
+            # Wait for page to load
+            try:
+                WebDriverWait(self.driver, 10).until(
+                    EC.presence_of_element_located((By.CSS_SELECTOR, "div.itemDetail"))
+                )
+            except TimeoutException:
+                logger.warning(f"Timeout waiting for item page to load: {item_url}")
                 return None
-            
-            # Try multiple selectors for price (Buyee specific)
-            price = None
-            price_selectors = [
-                'span.price',
-                'div.price',
-                'span[class*="price"]',
-                'div[class*="price"]',
-                'span[class*="amount"]',
-                'div[class*="amount"]',
-                'span[class*="current"]',
-                'div[class*="current"]',
-                'span[class*="bid"]',
-                'div[class*="bid"]',
-                'span[class*="current-price"]',
-                'div[class*="current-price"]',
-                'span[class*="current-bid"]',
-                'div[class*="current-bid"]',
-                'span[class*="buy-now-price"]',
-                'div[class*="buy-now-price"]'
+                
+            # Check for error pages
+            error_indicators = [
+                "この商品は存在しません",
+                "アクセスが集中しています",
+                "メンテナンス中",
+                "アクセスが制限されています",
+                "CAPTCHA",
+                "not found",
+                "maintenance",
+                "access denied"
             ]
             
-            for selector in price_selectors:
-                price_elem = soup.select_one(selector)
-                if price_elem:
-                    price_text = price_elem.get_text(strip=True)
-                    price_match = re.search(r'[\d,]+', price_text)
-                    if price_match:
-                        price = int(price_match.group().replace(',', ''))
-                        logging.info(f"Found price using selector '{selector}': {price}")
-                        break
-            
-            if not price:
-                logging.warning("Could not find price element")
+            page_source = self.driver.page_source
+            if any(indicator in page_source for indicator in error_indicators):
+                logger.warning(f"Error page detected: {item_url}")
+                self.save_debug_info(item_url, page_source, "error_page")
                 return None
-            
-            # Try multiple selectors for description (Buyee specific)
-            description = None
-            desc_selectors = [
-                'section#auction_item_description',
-                'div.item-description',
-                'div[class*="description"]',
-                'div[class*="detail"]',
-                'div[class*="content"]',
-                'div[class*="text"]',
-                'section[class*="description"]',
-                'section[class*="detail"]',
-                'section[class*="content"]',
-                'section[class*="text"]',
-                'div[class*="item-description"]',
-                'div[class*="product-description"]',
-                'div[class*="auction-description"]',
-                'div[class*="item-detail"]',
-                'div[class*="product-detail"]',
-                'div[class*="auction-detail"]',
-                'div[class*="item-content"]',
-                'div[class*="product-content"]',
-                'div[class*="auction-content"]'
-            ]
-            
-            for selector in desc_selectors:
-                desc_elem = soup.select_one(selector)
-                if desc_elem:
-                    description = desc_elem.get_text(strip=True)
-                    logging.info(f"Found description using selector '{selector}' (first 100 chars): {description[:100]}...")
-                    break
-            
-            if not description:
-                logging.warning("Could not find description element")
-                return None
-            
-            # Try multiple selectors for condition (Buyee specific)
-            condition = None
-            condition_selectors = [
-                'div.item-condition',
-                'div[class*="condition"]',
-                'div[class*="status"]',
-                'div[class*="quality"]',
-                'div[class*="rank"]',
-                'div[class*="grade"]',
-                'li:contains("Item Condition")',
-                'li:contains("Condition")',
-                'li:contains("Status")',
-                'li:contains("Quality")',
-                'div[class*="item-condition"]',
-                'div[class*="product-condition"]',
-                'div[class*="auction-condition"]',
-                'div[class*="item-status"]',
-                'div[class*="product-status"]',
-                'div[class*="auction-status"]',
-                'div[class*="item-quality"]',
-                'div[class*="product-quality"]',
-                'div[class*="auction-quality"]'
-            ]
-            
-            for selector in condition_selectors:
-                condition_elem = soup.select_one(selector)
-                if condition_elem:
-                    condition = condition_elem.get_text(strip=True)
-                    logging.info(f"Found condition using selector '{selector}': {condition}")
-                    break
-            
-            # Try multiple selectors for seller (Buyee specific)
-            seller = None
-            seller_selectors = [
-                'div.seller-name',
-                'div[class*="seller"]',
-                'div[class*="vendor"]',
-                'div[class*="shop"]',
-                'div[class*="store"]',
-                'div[class*="user"]',
-                'li:contains("Seller")',
-                'li:contains("Vendor")',
-                'li:contains("Shop")',
-                'li:contains("Store")',
-                'div[class*="seller-name"]',
-                'div[class*="vendor-name"]',
-                'div[class*="shop-name"]',
-                'div[class*="store-name"]',
-                'div[class*="user-name"]',
-                'div[class*="seller-info"]',
-                'div[class*="vendor-info"]',
-                'div[class*="shop-info"]',
-                'div[class*="store-info"]',
-                'div[class*="user-info"]'
-            ]
-            
-            for selector in seller_selectors:
-                seller_elem = soup.select_one(selector)
-                if seller_elem:
-                    seller = seller_elem.get_text(strip=True)
-                    logging.info(f"Found seller using selector '{selector}': {seller}")
-                    break
-            
-            # Try multiple selectors for images (Buyee specific)
-            images = []
-            image_selectors = [
-                'img.item-image',
-                'img[class*="item-image"]',
-                'img[class*="product-image"]',
-                'img[class*="main-image"]',
-                'img[class*="thumbnail"]',
-                'img[class*="photo"]',
-                'img[class*="picture"]',
-                'img[class*="auction"]',
-                'img[class*="detail"]',
-                'img[class*="content"]',
-                'img[class*="item-photo"]',
-                'img[class*="product-photo"]',
-                'img[class*="auction-photo"]',
-                'img[class*="item-picture"]',
-                'img[class*="product-picture"]',
-                'img[class*="auction-picture"]',
-                'img[class*="item-thumbnail"]',
-                'img[class*="product-thumbnail"]',
-                'img[class*="auction-thumbnail"]'
-            ]
-            
-            for selector in image_selectors:
-                img_elems = soup.select(selector)
-                for img in img_elems:
-                    src = img.get('src', '')
-                    if src:
-                        images.append(src)
-                        logging.info(f"Found image using selector '{selector}': {src}")
-            
-            # Extract card-specific information
-            card_info = {}
-            
-            # Try to find set code and card number
-            set_code_match = re.search(r'([A-Z]{2,4})-(\d{3})', title)
-            if set_code_match:
-                card_info['set_code'] = set_code_match.group(1)
-                card_info['card_number'] = set_code_match.group(2)
-                logging.info(f"Found set code and number: {card_info['set_code']}-{card_info['card_number']}")
-            
-            # Try to find edition
-            edition_keywords = {
-                '1st edition': ['1st', 'first edition', '初版'],
-                'unlimited': ['unlimited', '無制限', '再版']
+                
+            # Extract detailed information
+            item_data = {
+                'url': item_url,
+                'title': self.get_element_text("div.itemDetail__title"),
+                'price': self.extract_price(self.get_element_text("div.itemDetail__price")),
+                'description': self.get_element_text("div.itemDetail__description"),
+                'condition': self.get_element_text("div.itemDetail__condition"),
+                'seller': self.get_element_text("div.itemDetail__seller"),
+                'image_urls': self.get_image_urls()
             }
             
-            for edition, keywords in edition_keywords.items():
-                if any(keyword.lower() in title.lower() for keyword in keywords):
-                    card_info['edition'] = edition
-                    logging.info(f"Found edition: {edition}")
-                    break
-            
-            # Try to find rarity
-            rarity_keywords = {
-                'common': ['common', 'コモン'],
-                'rare': ['rare', 'レア'],
-                'super rare': ['super rare', 'sr', 'スーパーレア'],
-                'ultra rare': ['ultra rare', 'ur', 'ウルトラレア'],
-                'secret rare': ['secret rare', 'scr', 'シークレットレア'],
-                'ultimate rare': ['ultimate rare', 'utr', 'アルティメットレア'],
-                'ghost rare': ['ghost rare', 'gr', 'ゴーストレア'],
-                'platinum rare': ['platinum rare', 'plr', 'プラチナレア'],
-                'gold rare': ['gold rare', 'gld', 'ゴールドレア'],
-                'parallel rare': ['parallel rare', 'pr', 'パラレルレア'],
-                'collector\'s rare': ['collector\'s rare', 'cr', 'コレクターズレア'],
-                'quarter century': ['quarter century', 'qc', 'クォーターセンチュリー']
-            }
-            
-            for rarity, keywords in rarity_keywords.items():
-                if any(keyword.lower() in title.lower() for keyword in keywords):
-                    card_info['rarity'] = rarity
-                    logging.info(f"Found rarity: {rarity}")
-                    break
-            
-            # Try to find region
-            region_keywords = {
-                'asia': ['asia', 'asian', 'アジア', 'アジア版'],
-                'english': ['english', '英', '英語版'],
-                'japanese': ['japanese', '日', '日本語版'],
-                'korean': ['korean', '韓', '韓国版']
-            }
-            
-            for region, keywords in region_keywords.items():
-                if any(keyword.lower() in title.lower() for keyword in keywords):
-                    card_info['region'] = region
-                    logging.info(f"Found region: {region}")
-                    break
-            
-            # Log detailed information about the scraped data
-            logging.info(f"\nScraped detail page for: {title}")
-            logging.info(f"Price: {price}")
-            logging.info(f"Condition: {condition}")
-            logging.info(f"Seller: {seller}")
-            logging.info(f"Number of images: {len(images)}")
-            logging.info(f"Card info: {card_info}")
-            
-            return {
-                'title': title,
-                'price': price,
-                'description': description,
-                'condition': condition,
-                'seller': seller,
-                'images': images,
-                'card_info': card_info
-            }
+            # Get Yahoo Auction URL if available
+            try:
+                yahoo_url = self.driver.find_element(By.CSS_SELECTOR, "a.itemDetail__yahooLink").get_attribute("href")
+                item_data['yahoo_url'] = yahoo_url
+            except NoSuchElementException:
+                pass
+                
+            return item_data
             
         except Exception as e:
-            logging.error(f"Error scraping detail page: {str(e)}")
-            return None 
-
-    def save_initial_promising_links(self, summaries: List[Dict[str, Any]], search_term: str) -> None:
-        """Save initial promising links with hyperlinks and confidence scores."""
-        if not summaries:
-            logging.warning("No promising links to save")
-            return
-
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        base_filename = f"initial_leads_{search_term}_{timestamp}"
+            logger.error(f"Error scraping item detail page: {str(e)}")
+            self.save_debug_info(item_url, self.driver.page_source, "error")
+            return None
+            
+    def get_element_text(self, selector: str) -> str:
+        """Safely get text from an element."""
+        try:
+            element = self.driver.find_element(By.CSS_SELECTOR, selector)
+            return element.text
+        except NoSuchElementException:
+            return ""
+            
+    def get_image_urls(self) -> List[str]:
+        """Get all image URLs from the item page."""
+        image_urls = []
+        try:
+            images = self.driver.find_elements(By.CSS_SELECTOR, "img.itemDetail__image")
+            image_urls = [img.get_attribute("src") for img in images if img.get_attribute("src")]
+        except Exception as e:
+            logger.error(f"Error getting image URLs: {str(e)}")
+        return image_urls
         
-        # Create HTML report with hyperlinks
-        html_content = """
-        <html>
-        <head>
-            <meta charset="utf-8">
-            <style>
-                body { font-family: Arial, sans-serif; margin: 20px; }
-                table { border-collapse: collapse; width: 100%; }
-                th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
-                th { background-color: #f2f2f2; }
-                tr:nth-child(even) { background-color: #f9f9f9; }
-                tr:hover { background-color: #f5f5f5; }
-                .confidence-high { color: green; }
-                .confidence-medium { color: orange; }
-                .confidence-low { color: red; }
-                .thumbnail { max-width: 100px; max-height: 100px; cursor: pointer; }
-                .yahoo-link { color: blue; text-decoration: underline; }
-                .buyee-link { color: green; text-decoration: underline; }
-                .title-jp { font-size: 1.1em; margin-bottom: 5px; }
-                .title-en { color: #666; font-size: 0.9em; }
-                .links-cell { white-space: nowrap; }
-                .link-button {
-                    display: inline-block;
-                    padding: 5px 10px;
-                    margin: 2px;
-                    border-radius: 3px;
-                    text-decoration: none;
-                    color: white;
-                    font-weight: bold;
+    def extract_price(self, price_text: str) -> float:
+        """Extract price from text."""
+        try:
+            # Remove currency symbols and commas
+            price_text = ''.join(c for c in price_text if c.isdigit() or c == '.')
+            return float(price_text)
+        except (ValueError, TypeError):
+            return 0.0
+            
+    def handle_cookie_popup(self):
+        """Handle cookie consent popup if present."""
+        try:
+            cookie_button = WebDriverWait(self.driver, 5).until(
+                EC.element_to_be_clickable((By.CSS_SELECTOR, "button.cookieConsent__button"))
+            )
+            cookie_button.click()
+        except TimeoutException:
+            pass  # No cookie popup found
+            
+    def go_to_next_page(self) -> bool:
+        """Try to navigate to the next page of results."""
+        try:
+            next_button = self.driver.find_element(By.CSS_SELECTOR, "a.pagination__next")
+            if "disabled" not in next_button.get_attribute("class"):
+                next_button.click()
+                time.sleep(2)  # Wait for page to load
+                return True
+        except NoSuchElementException:
+            pass
+        return False
+        
+    def save_debug_info(self, url: str, page_source: str, error_type: str):
+        """Save debug information for failed scrapes."""
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"scraped_results/debug/{error_type}_{timestamp}.html"
+        
+        try:
+            with open(filename, 'w', encoding='utf-8') as f:
+                f.write(f"<!-- URL: {url} -->\n")
+                f.write(f"<!-- Error Type: {error_type} -->\n")
+                f.write(page_source)
+        except Exception as e:
+            logger.error(f"Error saving debug info: {str(e)}")
+            
+    def save_initial_leads(self, term: str, leads: List[Dict[str, Any]]):
+        """Save initial leads to a JSON file with detailed analysis."""
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"scraped_results/initial_leads/{term}_{timestamp}.json"
+        
+        try:
+            # Format leads for better readability
+            formatted_leads = []
+            for lead in leads:
+                formatted_lead = {
+                    'title': lead['title'],
+                    'url': lead['url'],
+                    'price': lead['price'],
+                    'condition': lead.get('condition', 'Unknown'),
+                    'analysis': {
+                        'estimated_value': lead['analysis']['estimated_value'],
+                        'profit_potential': lead['analysis']['profit_potential'],
+                        'recommendation': lead['analysis']['recommendation']
+                    },
+                    'card_info': {
+                        'rarity': lead['card_info'].rarity,
+                        'set_code': lead['card_info'].set_code,
+                        'card_number': lead['card_info'].card_number,
+                        'edition': lead['card_info'].edition,
+                        'region': lead['card_info'].region,
+                        'confidence_score': lead['card_info'].confidence_score
+                    }
                 }
-                .buyee-button { background-color: #4CAF50; }
-                .yahoo-button { background-color: #2196F3; }
-                .link-button:hover { opacity: 0.8; }
-            </style>
-            <script>
-                function openImage(url) {
-                    window.open(url, '_blank', 'width=800,height=600');
+                formatted_leads.append(formatted_lead)
+            
+            with open(filename, 'w', encoding='utf-8') as f:
+                json.dump(formatted_leads, f, ensure_ascii=False, indent=2)
+                
+            logger.info(f"Saved {len(formatted_leads)} leads to {filename}")
+            
+        except Exception as e:
+            logger.error(f"Error saving initial leads: {str(e)}")
+            
+    def save_final_gems(self, term: str, gems: List[Dict[str, Any]]):
+        """Save final gems to a JSON file with detailed analysis."""
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"scraped_results/final_gems/{term}_{timestamp}.json"
+        
+        try:
+            # Format gems for better readability
+            formatted_gems = []
+            for gem in gems:
+                formatted_gem = {
+                    'title': gem['title'],
+                    'url': gem['url'],
+                    'price': gem['price'],
+                    'condition': gem.get('condition', 'Unknown'),
+                    'analysis': {
+                        'estimated_value': gem['analysis']['estimated_value'],
+                        'profit_potential': gem['analysis']['profit_potential'],
+                        'recommendation': gem['analysis']['recommendation']
+                    },
+                    'card_info': {
+                        'rarity': gem['card_info'].rarity,
+                        'set_code': gem['card_info'].set_code,
+                        'card_number': gem['card_info'].card_number,
+                        'edition': gem['card_info'].edition,
+                        'region': gem['card_info'].region,
+                        'confidence_score': gem['card_info'].confidence_score
+                    },
+                    'images': gem.get('image_urls', [])
                 }
-            </script>
-        </head>
-        <body>
-            <h1>Initial Promising Links - {search_term}</h1>
-            <p>Generated on: {timestamp}</p>
-            <table>
-                <tr>
-                    <th>Title</th>
-                    <th>Price</th>
-                    <th>Confidence</th>
-                    <th>Matched Keywords</th>
-                    <th>Thumbnail</th>
-                    <th>Links</th>
-                </tr>
-        """.format(search_term=search_term, timestamp=timestamp)
-
-        for summary in summaries:
-            title = summary.get('title', '')
-            price = summary.get('price', 0)
-            analysis = summary.get('analysis', {})
-            confidence = analysis.get('confidence_score', 0)
-            matched_keywords = analysis.get('matched_keywords', [])
-            thumbnail_url = summary.get('thumbnail_url', '')
-            buyee_url = summary.get('url', '')
-            yahoo_url = summary.get('yahoo_url', '')
-
-            # Try to extract English title if available
-            title_parts = title.split('|')
-            title_jp = title_parts[0].strip()
-            title_en = title_parts[1].strip() if len(title_parts) > 1 else ''
-
-            # Determine confidence class
-            confidence_class = 'confidence-low'
-            if confidence >= 0.7:
-                confidence_class = 'confidence-high'
-            elif confidence >= 0.4:
-                confidence_class = 'confidence-medium'
-
-            html_content += f"""
-                <tr>
-                    <td>
-                        <div class="title-jp">{title_jp}</div>
-                        {f'<div class="title-en">{title_en}</div>' if title_en else ''}
-                    </td>
-                    <td>¥{price:,}</td>
-                    <td class="{confidence_class}">{confidence:.2f}</td>
-                    <td>{', '.join(matched_keywords)}</td>
-                    <td>
-                        <img src="{thumbnail_url}" class="thumbnail" alt="Thumbnail" 
-                             onclick="openImage('{thumbnail_url}')" 
-                             title="Click to view full size">
-                    </td>
-                    <td class="links-cell">
-                        <a href="{buyee_url}" class="link-button buyee-button" target="_blank">Buyee</a>
-                        {f'<a href="{yahoo_url}" class="link-button yahoo-button" target="_blank">Yahoo</a>' if yahoo_url else ''}
-                    </td>
-                </tr>
-            """
-
-        html_content += """
-            </table>
-        </body>
-        </html>
-        """
-
-        # Save HTML report
-        html_path = os.path.join(self.output_dir, f"{base_filename}.html")
-        with open(html_path, 'w', encoding='utf-8') as f:
-            f.write(html_content)
-        logging.info(f"Saved HTML report with hyperlinks to: {html_path}")
-
-        # Save CSV (for compatibility)
-        csv_path = os.path.join(self.output_dir, f"{base_filename}.csv")
-        with open(csv_path, 'w', newline='', encoding='utf-8') as f:
-            writer = csv.writer(f)
-            writer.writerow(['Title (JP)', 'Title (EN)', 'Price', 'Confidence', 'Matched Keywords', 'Buyee URL', 'Yahoo URL', 'Thumbnail URL'])
-            for summary in summaries:
-                title = summary.get('title', '')
-                title_parts = title.split('|')
-                title_jp = title_parts[0].strip()
-                title_en = title_parts[1].strip() if len(title_parts) > 1 else ''
-                writer.writerow([
-                    title_jp,
-                    title_en,
-                    summary.get('price', 0),
-                    summary.get('analysis', {}).get('confidence_score', 0),
-                    ','.join(summary.get('analysis', {}).get('matched_keywords', [])),
-                    summary.get('url', ''),
-                    summary.get('yahoo_url', ''),
-                    summary.get('thumbnail_url', '')
-                ])
-        logging.info(f"Saved CSV report to: {csv_path}")
-
-        # Save JSON (for programmatic access)
-        json_path = os.path.join(self.output_dir, f"{base_filename}.json")
-        with open(json_path, 'w', encoding='utf-8') as f:
-            json.dump(summaries, f, ensure_ascii=False, indent=2)
-        logging.info(f"Saved JSON report to: {json_path}") 
+                formatted_gems.append(formatted_gem)
+            
+            with open(filename, 'w', encoding='utf-8') as f:
+                json.dump(formatted_gems, f, ensure_ascii=False, indent=2)
+                
+            logger.info(f"Saved {len(formatted_gems)} gems to {filename}")
+            
+        except Exception as e:
+            logger.error(f"Error saving final gems: {str(e)}")
+            
+    def close(self):
+        """Close the WebDriver."""
+        if hasattr(self, 'driver'):
+            self.driver.quit() 

@@ -34,6 +34,13 @@ class CardInfo:
 
 class CardAnalyzer:
     def __init__(self):
+        # Value indicators for card analysis
+        self.value_indicators = {
+            'rarity': ['secret', 'ultimate', 'collector', 'gold', 'platinum', 'prismatic'],
+            'condition': ['mint', 'nm', 'ex', 'vg'],
+            'set': ['lob', 'sdj', 'sdy', 'sdk', 'mfc', 'crv', 'rymp']
+        }
+        
         # Condition keywords in Japanese and English
         self.condition_keywords = {
             CardCondition.MINT: [
