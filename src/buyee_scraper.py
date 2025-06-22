@@ -1,19 +1,76 @@
-from bs4 import BeautifulSoup
-import re
-import logging
-from typing import List, Dict, Optional, Any
+from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.common.by import By
+from selenium.common.exceptions import TimeoutException, WebDriverException, NoSuchElementException, StaleElementReferenceException
+from webdriver_manager.chrome import ChromeDriverManager
+from selenium_stealth import stealth
+from bs4 import BeautifulSoup
+import pandas as pd
 import time
-import os
-import csv
 import json
+import os
 from datetime import datetime
+import logging
+from urllib.parse import urljoin, quote
+from search_terms import SEARCH_TERMS
+import csv
+import traceback
+from typing import Dict, List, Optional, Any, Tuple
+from scraper_utils import RequestHandler, CardInfoExtractor, PriceAnalyzer, ConditionAnalyzer
+from dotenv import load_dotenv
+import re
+import socket
+import requests.exceptions
+import urllib3
+import argparse
+import statistics
+from image_analyzer import ImageAnalyzer
+import glob
+from card_analyzer import CardAnalyzer
+from rank_analyzer import RankAnalyzer, CardCondition
+from ai_analyzer import AIAnalyzer
+
+# Set up logging with more detailed format
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s',
+    handlers=[
+        logging.FileHandler('scraper.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# Load environment variables
+load_dotenv()
+api_key = os.getenv('OPENAI_API_KEY')
+if not api_key:
+    logger.error("OPENAI_API_KEY not found. Please check your .env file and its location.")
+    import sys
+    sys.exit(1)
 
 class BuyeeScraper:
-    def __init__(self, headless: bool = True):
-        # ... existing code ...
+    def __init__(self, output_dir: str = "scraped_results", max_pages: int = 5, headless: bool = True):
+        """
+        Initialize the BuyeeScraper with configuration options.
+        
+        Args:
+            output_dir (str): Directory to save scraped data
+            max_pages (int): Maximum number of pages to scrape per search
+            headless (bool): Run Chrome in headless mode
+        """
+        self.base_url = "https://buyee.jp"
+        self.output_dir = output_dir
+        self.max_pages = max_pages
+        self.headless = headless
+        self.driver = None
+        self.request_handler = RequestHandler()
+        self.card_analyzer = CardAnalyzer()
+        self.rank_analyzer = RankAnalyzer()
+        self.ai_analyzer = AIAnalyzer()
         
         # Search URL parameters
         self.search_params = {
@@ -23,6 +80,77 @@ class BuyeeScraper:
             'translationType': '98',
             'page': '1'
         }
+        
+        os.makedirs(self.output_dir, exist_ok=True)
+        self.setup_driver()
+        
+    def __enter__(self):
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.cleanup()
+        
+    def cleanup(self):
+        """Clean up resources and close the driver."""
+        if self.driver:
+            try:
+                self.driver.quit()
+            except Exception as e:
+                logger.error(f"Error during driver cleanup: {str(e)}")
+            self.driver = None
+            
+    def setup_driver(self):
+        """Set up and configure Chrome WebDriver with stealth mode."""
+        try:
+            chrome_options = Options()
+            
+            # Basic options
+            chrome_options.add_argument('--no-sandbox')
+            chrome_options.add_argument('--disable-dev-shm-usage')
+            chrome_options.add_argument('--disable-gpu')
+            chrome_options.add_argument('--disable-extensions')
+            chrome_options.add_argument('--disable-popup-blocking')
+            chrome_options.add_argument('--disable-notifications')
+            chrome_options.add_argument('--disable-infobars')
+            chrome_options.add_argument('--disable-blink-features=AutomationControlled')
+            
+            # SSL/TLS related options
+            chrome_options.add_argument('--ignore-certificate-errors')
+            chrome_options.add_argument('--allow-insecure-localhost')
+            
+            # Window size and user agent
+            chrome_options.add_argument('--window-size=1920,1080')
+            chrome_options.add_argument('--start-maximized')
+            
+            # Stealth mode configuration
+            chrome_options.add_experimental_option('excludeSwitches', ['enable-automation'])
+            chrome_options.add_experimental_option('useAutomationExtension', False)
+            
+            if self.headless:
+                chrome_options.add_argument('--headless=new')
+            
+            # Set up service
+            service = Service(ChromeDriverManager().install())
+            
+            # Initialize driver
+            self.driver = webdriver.Chrome(service=service, options=chrome_options)
+            
+            # Apply stealth mode
+            stealth(
+                self.driver,
+                languages=["ja-JP", "ja"],
+                vendor="Google Inc.",
+                platform="Win32",
+                webgl_vendor="Intel Inc.",
+                renderer="Intel Iris OpenGL Engine",
+                fix_hairline=True,
+            )
+            
+            logger.info("WebDriver initialized successfully")
+            
+        except Exception as e:
+            logger.error(f"Failed to setup WebDriver: {str(e)}")
+            raise
 
     def search_items(self, 
                     query: str,
@@ -59,12 +187,18 @@ class BuyeeScraper:
             
             try:
                 self.driver.get(search_url)
-                WebDriverWait(self.driver, 10).until(
-                    EC.presence_of_element_located((By.CSS_SELECTOR, "div[class*='itemCard']"))
-                )
+                
+                # Wait for item cards to load
+                try:
+                    WebDriverWait(self.driver, 10).until(
+                        EC.presence_of_element_located((By.CSS_SELECTOR, "li.itemCard"))
+                    )
+                except TimeoutException:
+                    logging.warning(f"Timeout waiting for item cards on page {page}")
+                    continue
                 
                 # Get all item cards
-                item_cards = self.driver.find_elements(By.CSS_SELECTOR, "div[class*='itemCard']")
+                item_cards = self.driver.find_elements(By.CSS_SELECTOR, "li.itemCard")
                 logging.info(f"Found {len(item_cards)} items on page {page}")
                 
                 for card in item_cards:
@@ -72,6 +206,45 @@ class BuyeeScraper:
                         # Extract item data
                         item_data = self._extract_item_data(card)
                         if item_data:
+                            # Try to get more details from the item page
+                            try:
+                                # Click the item link to open detail page
+                                link_elem = card.find_element(By.CSS_SELECTOR, "div.itemCard__itemName a")
+                                item_url = link_elem.get_attribute('href')
+                                
+                                # Open detail page in new tab
+                                self.driver.execute_script("window.open(arguments[0]);", item_url)
+                                self.driver.switch_to.window(self.driver.window_handles[-1])
+                                
+                                # Wait for detail page to load
+                                try:
+                                    WebDriverWait(self.driver, 10).until(
+                                        EC.presence_of_element_located((By.CSS_SELECTOR, "section#auction_item_description"))
+                                    )
+                                    
+                                    # Get page source and analyze
+                                    detail_html = self.driver.page_source
+                                    detail_data = self.scrape_item_detail_page(detail_html)
+                                    
+                                    if detail_data:
+                                        # Merge detail data with item data
+                                        item_data.update(detail_data)
+                                        logging.info(f"Successfully scraped detail page for item: {item_data.get('title', '')}")
+                                    else:
+                                        logging.warning(f"Failed to scrape detail page for item: {item_data.get('title', '')}")
+                                    
+                                except TimeoutException:
+                                    logging.warning(f"Timeout waiting for detail page to load: {item_url}")
+                                except Exception as e:
+                                    logging.error(f"Error scraping detail page: {str(e)}")
+                                
+                                # Close detail tab and switch back to search results
+                                self.driver.close()
+                                self.driver.switch_to.window(self.driver.window_handles[0])
+                                
+                            except Exception as e:
+                                logging.error(f"Error processing detail page: {str(e)}")
+                            
                             all_items.append(item_data)
                     except Exception as e:
                         logging.error(f"Error processing item card: {str(e)}")
@@ -86,21 +259,66 @@ class BuyeeScraper:
     def _extract_item_data(self, card) -> Optional[Dict[str, Any]]:
         """Extract data from an item card."""
         try:
-            # ... existing code ...
+            # Extract title - the correct selector is "div.itemCard__itemName a"
+            title_elem = card.find_element(By.CSS_SELECTOR, "div.itemCard__itemName a")
+            title = title_elem.text.strip()
             
-            # Extract bid count and popularity score if available
+            # Extract price - the correct selector is "span.g-price" within "div.g-priceDetails"
+            price_elem = card.find_element(By.CSS_SELECTOR, "div.g-priceDetails span.g-price")
+            price_text = price_elem.text.strip()
+            price_match = re.search(r'[\d,]+', price_text)
+            if not price_match:
+                return None
+            price = int(price_match.group().replace(',', ''))
+            
+            # Extract URL - the correct selector is "div.itemCard__itemName a"
+            link_elem = card.find_element(By.CSS_SELECTOR, "div.itemCard__itemName a")
+            url = link_elem.get_attribute('href')
+            
+            # Extract image URL - the correct selector is "img.lazyLoadV2.g-thumbnail__image"
+            img_elem = card.find_element(By.CSS_SELECTOR, "img.lazyLoadV2.g-thumbnail__image")
+            image_url = img_elem.get_attribute('src')
+            if not image_url or image_url.endswith('spacer.gif'):
+                # Try data-src attribute for lazy-loaded images
+                image_url = img_elem.get_attribute('data-src')
+            
+            # Extract bid count - the correct selector is "span.g-text" within the bid info item
             bid_count = None
-            popularity_score = None
-            
             try:
-                bid_element = card.find_element(By.CSS_SELECTOR, "span[class*='bidCount']")
-                bid_count = int(bid_element.text.strip())
+                # Find the bid count from the info list
+                info_items = card.find_elements(By.CSS_SELECTOR, "li.itemCard__infoItem")
+                for item in info_items:
+                    title_span = item.find_element(By.CSS_SELECTOR, "span.g-title")
+                    if "Number of Bids" in title_span.text:
+                        bid_text_elem = item.find_element(By.CSS_SELECTOR, "span.g-text")
+                        bid_count = int(bid_text_elem.text.strip())
+                        break
             except:
                 pass
                 
+            # Extract time remaining
+            time_remaining = None
             try:
-                score_element = card.find_element(By.CSS_SELECTOR, "span[class*='score']")
-                popularity_score = int(score_element.text.strip())
+                info_items = card.find_elements(By.CSS_SELECTOR, "li.itemCard__infoItem")
+                for item in info_items:
+                    title_span = item.find_element(By.CSS_SELECTOR, "span.g-title")
+                    if "Time Remaining" in title_span.text:
+                        time_elem = item.find_element(By.CSS_SELECTOR, "span.g-text")
+                        time_remaining = time_elem.text.strip()
+                        break
+            except:
+                pass
+            
+            # Extract seller
+            seller = None
+            try:
+                info_items = card.find_elements(By.CSS_SELECTOR, "li.itemCard__infoItem")
+                for item in info_items:
+                    title_span = item.find_element(By.CSS_SELECTOR, "span.g-title")
+                    if "Seller" in title_span.text:
+                        seller_elem = item.find_element(By.CSS_SELECTOR, "span.g-text a")
+                        seller = seller_elem.text.strip()
+                        break
             except:
                 pass
             
@@ -111,196 +329,13 @@ class BuyeeScraper:
                 'url': url,
                 'image_url': image_url,
                 'bid_count': bid_count,
-                'popularity_score': popularity_score
+                'time_remaining': time_remaining,
+                'seller': seller
             }
             
         except Exception as e:
             logging.error(f"Error extracting item data: {str(e)}")
             return None
-
-    def get_item_summaries_from_search_page(self, html_content: str) -> List[Dict]:
-        """Extract item summaries from a search page."""
-        soup = BeautifulSoup(html_content, 'html.parser')
-        items = []
-        
-        # Find all item containers
-        item_containers = soup.find_all('div', class_='item-card')
-        
-        for container in item_containers:
-            try:
-                # Extract basic information
-                title_elem = container.find('div', class_='item-card__title')
-                price_elem = container.find('div', class_='item-card__price')
-                link_elem = container.find('a', class_='item-card__link')
-                
-                if not all([title_elem, price_elem, link_elem]):
-                    continue
-                
-                title = title_elem.get_text(strip=True)
-                price_text = price_elem.get_text(strip=True)
-                link = link_elem.get('href', '')
-                
-                # Extract price value
-                price_match = re.search(r'[\d,]+', price_text)
-                if not price_match:
-                    continue
-                    
-                price = int(price_match.group().replace(',', ''))
-                
-                # Skip if price is too high
-                if price > self.max_price:
-                    continue
-                
-                # Analyze title for valuable keywords
-                title_lower = title.lower()
-                confidence = 0.0
-                matched_keywords = []
-                
-                # Yu-Gi-Oh! specific keywords
-                yugioh_keywords = [
-                    '遊戯王', 'yugioh', 'yu-gi-oh', 'yu gi oh',
-                    '青眼', 'blue-eyes', 'blue eyes',
-                    'ブラック・マジシャン', 'black magician', 'dark magician',
-                    'レッドアイズ', 'red-eyes', 'red eyes',
-                    'エクゾディア', 'exodia',
-                    'カオス', 'chaos',
-                    'サイバー', 'cyber',
-                    'エレメンタル・ヒーロー', 'elemental hero',
-                    'デステニー・ヒーロー', 'destiny hero',
-                    'ネオス', 'neos',
-                    'スターダスト', 'stardust',
-                    'ブラックローズ', 'black rose',
-                    'アーカナイト', 'arcanite',
-                    'シンクロ', 'synchro',
-                    'エクシーズ', 'xyz',
-                    'リンク', 'link',
-                    'ペンデュラム', 'pendulum',
-                    '融合', 'fusion',
-                    '儀式', 'ritual',
-                    '効果', 'effect',
-                    '通常', 'normal',
-                    '永続', 'continuous',
-                    '速攻', 'quick-play',
-                    '罠', 'trap',
-                    '魔法', 'spell',
-                    'モンスター', 'monster',
-                    'カード', 'card',
-                    'トレカ', 'trading card',
-                    'レア', 'rare',
-                    'スーパーレア', 'super rare',
-                    'ウルトラレア', 'ultra rare',
-                    'シークレットレア', 'secret rare',
-                    'アルティメットレア', 'ultimate rare',
-                    'ゴールドレア', 'gold rare',
-                    'プラチナレア', 'platinum rare',
-                    'パラレルレア', 'parallel rare',
-                    'コレクターズレア', 'collector\'s rare',
-                    'クォーターセンチュリー', 'quarter century',
-                    '1st', 'first edition', '初版',
-                    '限定', 'limited',
-                    '特典', 'promo',
-                    '大会', 'tournament',
-                    'イベント', 'event',
-                    'チャンピオンシップ', 'championship'
-                ]
-                
-                # Check for Yu-Gi-Oh! keywords
-                for keyword in yugioh_keywords:
-                    if keyword.lower() in title_lower:
-                        confidence += 0.1  # Small boost for each keyword match
-                        matched_keywords.append(keyword)
-                
-                # Check for set codes (e.g., LOB-001, MRD-060)
-                set_code_match = re.search(r'([A-Z]{2,4})-(\d{3})', title)
-                if set_code_match:
-                    confidence += 0.3  # Significant boost for set code
-                    matched_keywords.append(set_code_match.group(0))
-                
-                # Check for condition keywords
-                condition_keywords = {
-                    'mint': ['mint', 'ミント'],
-                    'near mint': ['near mint', 'nm', 'ニアミント'],
-                    'excellent': ['excellent', 'ex', 'エクセレント'],
-                    'good': ['good', 'gd', 'グッド'],
-                    'light played': ['light played', 'lp', 'ライトプレイ'],
-                    'played': ['played', 'pl', 'プレイ'],
-                    'poor': ['poor', 'pr', 'プア']
-                }
-                
-                for condition, keywords in condition_keywords.items():
-                    if any(keyword.lower() in title_lower for keyword in keywords):
-                        confidence += 0.2
-                        matched_keywords.append(condition)
-                
-                # Check for rarity keywords
-                rarity_keywords = {
-                    'common': ['common', 'コモン'],
-                    'rare': ['rare', 'レア'],
-                    'super rare': ['super rare', 'sr', 'スーパーレア'],
-                    'ultra rare': ['ultra rare', 'ur', 'ウルトラレア'],
-                    'secret rare': ['secret rare', 'scr', 'シークレットレア'],
-                    'ultimate rare': ['ultimate rare', 'utr', 'アルティメットレア'],
-                    'ghost rare': ['ghost rare', 'gr', 'ゴーストレア'],
-                    'platinum rare': ['platinum rare', 'plr', 'プラチナレア'],
-                    'gold rare': ['gold rare', 'gld', 'ゴールドレア'],
-                    'parallel rare': ['parallel rare', 'pr', 'パラレルレア'],
-                    'collector\'s rare': ['collector\'s rare', 'cr', 'コレクターズレア'],
-                    'quarter century': ['quarter century', 'qc', 'クォーターセンチュリー']
-                }
-                
-                for rarity, keywords in rarity_keywords.items():
-                    if any(keyword.lower() in title_lower for keyword in keywords):
-                        confidence += 0.2
-                        matched_keywords.append(rarity)
-                
-                # Check for edition keywords
-                edition_keywords = {
-                    '1st edition': ['1st', 'first edition', '初版'],
-                    'unlimited': ['unlimited', '無制限', '再版']
-                }
-                
-                for edition, keywords in edition_keywords.items():
-                    if any(keyword.lower() in title_lower for keyword in keywords):
-                        confidence += 0.15
-                        matched_keywords.append(edition)
-                
-                # Check for region keywords
-                region_keywords = {
-                    'asia': ['asia', 'asian', 'アジア', 'アジア版'],
-                    'english': ['english', '英', '英語版'],
-                    'japanese': ['japanese', '日', '日本語版'],
-                    'korean': ['korean', '韓', '韓国版']
-                }
-                
-                for region, keywords in region_keywords.items():
-                    if any(keyword.lower() in title_lower for keyword in keywords):
-                        confidence += 0.15
-                        matched_keywords.append(region)
-                
-                # Log detailed information about the item
-                logging.info(f"\nAnalyzing item: {title}")
-                logging.info(f"Price: {price}")
-                logging.info(f"Matched keywords: {', '.join(matched_keywords)}")
-                logging.info(f"Confidence score: {confidence:.2f}")
-                
-                # Lower confidence threshold to 0.1 (from 0.2)
-                if confidence >= 0.1:
-                    items.append({
-                        'title': title,
-                        'price': price,
-                        'link': link,
-                        'confidence': confidence,
-                        'matched_keywords': matched_keywords
-                    })
-                    logging.info("Item ACCEPTED")
-                else:
-                    logging.info("Item REJECTED - Low confidence")
-                
-            except Exception as e:
-                logging.error(f"Error processing item: {str(e)}")
-                continue
-        
-        return items 
 
     def scrape_item_detail_page(self, html_content: str) -> Optional[Dict]:
         """Scrape detailed information from an item's detail page."""
@@ -422,70 +457,7 @@ class BuyeeScraper:
                 logging.warning("Could not find description element")
                 return None
             
-            # Try multiple selectors for condition (Buyee specific)
-            condition = None
-            condition_selectors = [
-                'div.item-condition',
-                'div[class*="condition"]',
-                'div[class*="status"]',
-                'div[class*="quality"]',
-                'div[class*="rank"]',
-                'div[class*="grade"]',
-                'li:contains("Item Condition")',
-                'li:contains("Condition")',
-                'li:contains("Status")',
-                'li:contains("Quality")',
-                'div[class*="item-condition"]',
-                'div[class*="product-condition"]',
-                'div[class*="auction-condition"]',
-                'div[class*="item-status"]',
-                'div[class*="product-status"]',
-                'div[class*="auction-status"]',
-                'div[class*="item-quality"]',
-                'div[class*="product-quality"]',
-                'div[class*="auction-quality"]'
-            ]
-            
-            for selector in condition_selectors:
-                condition_elem = soup.select_one(selector)
-                if condition_elem:
-                    condition = condition_elem.get_text(strip=True)
-                    logging.info(f"Found condition using selector '{selector}': {condition}")
-                    break
-            
-            # Try multiple selectors for seller (Buyee specific)
-            seller = None
-            seller_selectors = [
-                'div.seller-name',
-                'div[class*="seller"]',
-                'div[class*="vendor"]',
-                'div[class*="shop"]',
-                'div[class*="store"]',
-                'div[class*="user"]',
-                'li:contains("Seller")',
-                'li:contains("Vendor")',
-                'li:contains("Shop")',
-                'li:contains("Store")',
-                'div[class*="seller-name"]',
-                'div[class*="vendor-name"]',
-                'div[class*="shop-name"]',
-                'div[class*="store-name"]',
-                'div[class*="user-name"]',
-                'div[class*="seller-info"]',
-                'div[class*="vendor-info"]',
-                'div[class*="shop-info"]',
-                'div[class*="store-info"]',
-                'div[class*="user-info"]'
-            ]
-            
-            for selector in seller_selectors:
-                seller_elem = soup.select_one(selector)
-                if seller_elem:
-                    seller = seller_elem.get_text(strip=True)
-                    logging.info(f"Found seller using selector '{selector}': {seller}")
-                    break
-            
-            # Try multiple selectors for images (Buyee specific)
+            # Enhanced image handling for lazy-loaded images
             images = []
             image_selectors = [
                 'img.item-image',
@@ -512,90 +484,78 @@ class BuyeeScraper:
             for selector in image_selectors:
                 img_elems = soup.select(selector)
                 for img in img_elems:
-                    src = img.get('src', '')
-                    if src:
-                        images.append(src)
-                        logging.info(f"Found image using selector '{selector}': {src}")
+                    # Try data-src first (lazy-loaded image)
+                    image_url = img.get('data-src')
+                    if not image_url or 'spacer.gif' in image_url:
+                        # Fall back to src if data-src is not available or is a placeholder
+                        image_url = img.get('src')
+                    
+                    if image_url and not any(x in image_url.lower() for x in ['spacer.gif', 'blank.gif', 'placeholder']):
+                        images.append(image_url)
+                        logging.info(f"Found image using selector '{selector}': {image_url}")
             
-            # Extract card-specific information
-            card_info = {}
+            # Get the first image URL for analysis
+            image_url = images[0] if images else None
             
-            # Try to find set code and card number
-            set_code_match = re.search(r'([A-Z]{2,4})-(\d{3})', title)
-            if set_code_match:
-                card_info['set_code'] = set_code_match.group(1)
-                card_info['card_number'] = set_code_match.group(2)
-                logging.info(f"Found set code and number: {card_info['set_code']}-{card_info['card_number']}")
+            # Get eBay prices
+            ebay_prices = self.ai_analyzer.get_ebay_prices(title, description)
             
-            # Try to find edition
-            edition_keywords = {
-                '1st edition': ['1st', 'first edition', '初版'],
-                'unlimited': ['unlimited', '無制限', '再版']
-            }
+            # Analyze the card
+            analysis = self.ai_analyzer.analyze_card(
+                title=title,
+                description=description,
+                price_yen=price,
+                image_url=image_url,
+                ebay_prices=ebay_prices
+            )
             
-            for edition, keywords in edition_keywords.items():
-                if any(keyword.lower() in title.lower() for keyword in keywords):
-                    card_info['edition'] = edition
-                    logging.info(f"Found edition: {edition}")
-                    break
-            
-            # Try to find rarity
-            rarity_keywords = {
-                'common': ['common', 'コモン'],
-                'rare': ['rare', 'レア'],
-                'super rare': ['super rare', 'sr', 'スーパーレア'],
-                'ultra rare': ['ultra rare', 'ur', 'ウルトラレア'],
-                'secret rare': ['secret rare', 'scr', 'シークレットレア'],
-                'ultimate rare': ['ultimate rare', 'utr', 'アルティメットレア'],
-                'ghost rare': ['ghost rare', 'gr', 'ゴーストレア'],
-                'platinum rare': ['platinum rare', 'plr', 'プラチナレア'],
-                'gold rare': ['gold rare', 'gld', 'ゴールドレア'],
-                'parallel rare': ['parallel rare', 'pr', 'パラレルレア'],
-                'collector\'s rare': ['collector\'s rare', 'cr', 'コレクターズレア'],
-                'quarter century': ['quarter century', 'qc', 'クォーターセンチュリー']
-            }
-            
-            for rarity, keywords in rarity_keywords.items():
-                if any(keyword.lower() in title.lower() for keyword in keywords):
-                    card_info['rarity'] = rarity
-                    logging.info(f"Found rarity: {rarity}")
-                    break
-            
-            # Try to find region
-            region_keywords = {
-                'asia': ['asia', 'asian', 'アジア', 'アジア版'],
-                'english': ['english', '英', '英語版'],
-                'japanese': ['japanese', '日', '日本語版'],
-                'korean': ['korean', '韓', '韓国版']
-            }
-            
-            for region, keywords in region_keywords.items():
-                if any(keyword.lower() in title.lower() for keyword in keywords):
-                    card_info['region'] = region
-                    logging.info(f"Found region: {region}")
-                    break
+            if not analysis:
+                logging.warning("AI analysis failed")
+                return None
             
             # Log detailed information about the scraped data
             logging.info(f"\nScraped detail page for: {title}")
             logging.info(f"Price: {price}")
-            logging.info(f"Condition: {condition}")
-            logging.info(f"Seller: {seller}")
-            logging.info(f"Number of images: {len(images)}")
-            logging.info(f"Card info: {card_info}")
+            logging.info(f"Card Info: {analysis.card_name} ({analysis.set_code}-{analysis.card_number})")
+            logging.info(f"Condition: {analysis.condition.value}")
+            logging.info(f"Market Price: ${analysis.market_price:,.2f}")
+            logging.info(f"Profit Margin: {analysis.profit_margin:.1%}")
+            logging.info(f"Recommendation: {analysis.recommendation}")
+            logging.info(f"Confidence: {analysis.confidence:.1%}")
             
             return {
                 'title': title,
                 'price': price,
                 'description': description,
-                'condition': condition,
-                'seller': seller,
                 'images': images,
-                'card_info': card_info
+                'analysis': {
+                    'card_info': {
+                        'card_name': analysis.card_name,
+                        'set_code': analysis.set_code,
+                        'card_number': analysis.card_number,
+                        'rarity': analysis.rarity,
+                        'edition': analysis.edition,
+                        'region': analysis.region
+                    },
+                    'condition': {
+                        'grade': analysis.condition.value,
+                        'notes': analysis.condition_notes
+                    },
+                    'market': {
+                        'ebay_price': analysis.market_price,
+                        'profit_margin': analysis.profit_margin
+                    },
+                    'ai_analysis': {
+                        'confidence': analysis.confidence,
+                        'recommendation': analysis.recommendation,
+                        'notes': analysis.notes
+                    }
+                }
             }
             
         except Exception as e:
             logging.error(f"Error scraping detail page: {str(e)}")
-            return None 
+            return None
 
     def save_initial_promising_links(self, summaries: List[Dict[str, Any]], search_term: str) -> None:
         """Save initial promising links with hyperlinks and confidence scores."""
@@ -622,8 +582,6 @@ class BuyeeScraper:
                 .confidence-medium { color: orange; }
                 .confidence-low { color: red; }
                 .thumbnail { max-width: 100px; max-height: 100px; cursor: pointer; }
-                .yahoo-link { color: blue; text-decoration: underline; }
-                .buyee-link { color: green; text-decoration: underline; }
                 .title-jp { font-size: 1.1em; margin-bottom: 5px; }
                 .title-en { color: #666; font-size: 0.9em; }
                 .links-cell { white-space: nowrap; }
@@ -639,6 +597,10 @@ class BuyeeScraper:
                 .buyee-button { background-color: #4CAF50; }
                 .yahoo-button { background-color: #2196F3; }
                 .link-button:hover { opacity: 0.8; }
+                .card-info { font-size: 0.9em; color: #666; }
+                .condition-info { font-size: 0.9em; }
+                .market-info { font-size: 0.9em; color: #2196F3; }
+                .ai-analysis { font-size: 0.9em; color: #4CAF50; }
             </style>
             <script>
                 function openImage(url) {
@@ -652,9 +614,12 @@ class BuyeeScraper:
             <table>
                 <tr>
                     <th>Title</th>
+                    <th>Card Info</th>
+                    <th>Condition</th>
                     <th>Price</th>
+                    <th>Market Analysis</th>
+                    <th>AI Assessment</th>
                     <th>Confidence</th>
-                    <th>Matched Keywords</th>
                     <th>Thumbnail</th>
                     <th>Links</th>
                 </tr>
@@ -669,6 +634,30 @@ class BuyeeScraper:
             thumbnail_url = summary.get('thumbnail_url', '')
             buyee_url = summary.get('url', '')
             yahoo_url = summary.get('yahoo_url', '')
+            
+            # Extract card information
+            card_info = analysis.get('card_info', {})
+            set_code = card_info.get('set_code', '')
+            card_number = card_info.get('card_number', '')
+            rarity = card_info.get('rarity', '')
+            edition = card_info.get('edition', '')
+            region = card_info.get('region', '')
+            
+            # Extract condition information
+            condition = analysis.get('condition', {})
+            condition_grade = condition.get('grade', '')
+            condition_notes = condition.get('notes', [])
+            
+            # Extract market analysis
+            market = analysis.get('market', {})
+            ebay_price = market.get('ebay_price', 0)
+            profit_margin = market.get('profit_margin', 0)
+            
+            # Extract AI analysis
+            ai_analysis = analysis.get('ai_analysis', {})
+            ai_confidence = ai_analysis.get('confidence', 0)
+            ai_recommendation = ai_analysis.get('recommendation', '')
+            ai_notes = ai_analysis.get('notes', [])
 
             # Try to extract English title if available
             title_parts = title.split('|')
@@ -688,9 +677,27 @@ class BuyeeScraper:
                         <div class="title-jp">{title_jp}</div>
                         {f'<div class="title-en">{title_en}</div>' if title_en else ''}
                     </td>
+                    <td class="card-info">
+                        {f'Set: {set_code}-{card_number}<br>' if set_code and card_number else ''}
+                        {f'Rarity: {rarity}<br>' if rarity else ''}
+                        {f'Edition: {edition}<br>' if edition else ''}
+                        {f'Region: {region}' if region else ''}
+                    </td>
+                    <td class="condition-info">
+                        {f'Grade: {condition_grade}<br>' if condition_grade else ''}
+                        {f'Notes: {", ".join(condition_notes)}' if condition_notes else ''}
+                    </td>
                     <td>¥{price:,}</td>
+                    <td class="market-info">
+                        {f'eBay: ${ebay_price:,.2f}<br>' if ebay_price else ''}
+                        {f'Margin: {profit_margin:.1%}' if profit_margin else ''}
+                    </td>
+                    <td class="ai-analysis">
+                        {f'Confidence: {ai_confidence:.1%}<br>' if ai_confidence else ''}
+                        {f'Recommendation: {ai_recommendation}<br>' if ai_recommendation else ''}
+                        {f'Notes: {", ".join(ai_notes)}' if ai_notes else ''}
+                    </td>
                     <td class="{confidence_class}">{confidence:.2f}</td>
-                    <td>{', '.join(matched_keywords)}</td>
                     <td>
                         <img src="{thumbnail_url}" class="thumbnail" alt="Thumbnail" 
                              onclick="openImage('{thumbnail_url}')" 
@@ -719,20 +726,41 @@ class BuyeeScraper:
         csv_path = os.path.join(self.output_dir, f"{base_filename}.csv")
         with open(csv_path, 'w', newline='', encoding='utf-8') as f:
             writer = csv.writer(f)
-            writer.writerow(['Title (JP)', 'Title (EN)', 'Price', 'Confidence', 'Matched Keywords', 'Buyee URL', 'Yahoo URL', 'Thumbnail URL'])
+            writer.writerow([
+                'Title (JP)', 'Title (EN)', 
+                'Set Code', 'Card Number', 'Rarity', 'Edition', 'Region',
+                'Condition Grade', 'Condition Notes',
+                'Price (JPY)', 'eBay Price (USD)', 'Profit Margin',
+                'AI Confidence', 'AI Recommendation', 'AI Notes',
+                'Overall Confidence', 'Matched Keywords',
+                'Buyee URL', 'Yahoo URL', 'Thumbnail URL'
+            ])
+            
             for summary in summaries:
                 title = summary.get('title', '')
                 title_parts = title.split('|')
                 title_jp = title_parts[0].strip()
                 title_en = title_parts[1].strip() if len(title_parts) > 1 else ''
+                
+                analysis = summary.get('analysis', {})
+                card_info = analysis.get('card_info', {})
+                condition = analysis.get('condition', {})
+                market = analysis.get('market', {})
+                ai_analysis = analysis.get('ai_analysis', {})
+                
                 writer.writerow([
-                    title_jp,
-                    title_en,
-                    summary.get('price', 0),
-                    summary.get('analysis', {}).get('confidence_score', 0),
-                    ','.join(summary.get('analysis', {}).get('matched_keywords', [])),
-                    summary.get('url', ''),
-                    summary.get('yahoo_url', ''),
+                    title_jp, title_en,
+                    card_info.get('set_code', ''), card_info.get('card_number', ''),
+                    card_info.get('rarity', ''), card_info.get('edition', ''),
+                    card_info.get('region', ''),
+                    condition.get('grade', ''), ','.join(condition.get('notes', [])),
+                    summary.get('price', 0), market.get('ebay_price', 0),
+                    market.get('profit_margin', 0),
+                    ai_analysis.get('confidence', 0), ai_analysis.get('recommendation', ''),
+                    ','.join(ai_analysis.get('notes', [])),
+                    analysis.get('confidence_score', 0),
+                    ','.join(analysis.get('matched_keywords', [])),
+                    summary.get('url', ''), summary.get('yahoo_url', ''),
                     summary.get('thumbnail_url', '')
                 ])
         logging.info(f"Saved CSV report to: {csv_path}")
@@ -741,4 +769,37 @@ class BuyeeScraper:
         json_path = os.path.join(self.output_dir, f"{base_filename}.json")
         with open(json_path, 'w', encoding='utf-8') as f:
             json.dump(summaries, f, ensure_ascii=False, indent=2)
-        logging.info(f"Saved JSON report to: {json_path}") 
+        logging.info(f"Saved JSON report to: {json_path}")
+
+def main():
+    """Main function to run the scraper."""
+    parser = argparse.ArgumentParser(description='Buyee Card Scraper')
+    parser.add_argument('--query', type=str, help='Search query')
+    parser.add_argument('--sort', type=str, choices=['bids', 'popular'], default='bids',
+                      help='Sort method (bids or popular)')
+    parser.add_argument('--pages', type=int, default=1, help='Number of pages to scrape')
+    parser.add_argument('--output', type=str, default='scraped_results',
+                      help='Output directory')
+    parser.add_argument('--headless', action='store_true', help='Run in headless mode')
+    
+    args = parser.parse_args()
+    
+    try:
+        with BuyeeScraper(output_dir=args.output, max_pages=args.pages, headless=args.headless) as scraper:
+            if args.query:
+                results = scraper.search_items(args.query, sort_by=args.sort, max_pages=args.pages)
+                if results:
+                    scraper.save_initial_promising_links(results, args.query)
+            else:
+                # Use search terms from search_terms.py
+                for term in SEARCH_TERMS:
+                    results = scraper.search_items(term, sort_by=args.sort, max_pages=args.pages)
+                    if results:
+                        scraper.save_initial_promising_links(results, term)
+                    
+    except Exception as e:
+        logger.error(f"Error in main: {str(e)}")
+        traceback.print_exc()
+
+if __name__ == "__main__":
+    main() 

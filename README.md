@@ -68,16 +68,21 @@ Available options:
 
 ```
 .
-├── buyee_scraper.py          # Main scraper implementation
-├── scraper_utils.py          # Utility classes and functions
-├── card_analyzer.py          # Card analysis logic
-├── image_analyzer.py         # Image processing
-├── rank_analyzer.py          # Card ranking analysis
-├── search_terms.py           # Search term definitions
+├── src/                      # Source code directory
+│   ├── buyee_scraper.py     # Main scraper implementation
+│   ├── scraper_utils.py     # Utility classes and functions
+│   ├── card_analyzer.py     # Card analysis logic
+│   ├── image_analyzer.py    # Image processing
+│   ├── rank_analyzer.py     # Card ranking analysis
+│   └── search_terms.py      # Search term definitions
 ├── requirements.txt          # Project dependencies
 ├── .env                      # Environment variables
+├── README.md                 # Project documentation
+├── buyee_listings.csv        # Scraped data
+├── buyee_listings.json       # Scraped data
+├── scraper.log               # Log file
 ├── scraped_results/          # Directory for scraped data
-└── logs/                     # Directory for log files
+└── venv/                     # Python virtual environment
 ```
 
 ## Error Handling

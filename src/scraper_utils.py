@@ -198,51 +198,34 @@ class PriceAnalyzer:
         """Get price data from 130point.com."""
         try:
             search_term = f"{card_name} {set_code}" if set_code else card_name
-            search_term = quote(search_term)
-            url = f"https://130point.com/sales/?item={search_term}"
+            url = f"https://www.130point.com/sales/search/?q={quote(search_term)}"
             
-            time.sleep(random.uniform(2, 4))
-            html_content = self.request_handler.get_page(url)
-            if not html_content:
+            html = self.request_handler.get_page(url)
+            if not html:
                 return None
             
-            soup = BeautifulSoup(html_content, 'html.parser')
+            soup = BeautifulSoup(html, 'html.parser')
             
-            raw_prices = []
-            psa_9_prices = []
-            psa_10_prices = []
-            
-            sales = soup.find_all('div', class_='sale-item')
-            for sale in sales:
+            # Extract prices
+            prices = []
+            for price_elem in soup.select('span.price'):
                 try:
-                    price_elem = sale.find('span', class_='price')
-                    if not price_elem:
-                        continue
-                    price = float(price_elem.text.strip().replace('$', '').replace(',', ''))
-                    
-                    condition_elem = sale.find('span', class_='condition')
-                    if not condition_elem:
-                        continue
-                    condition = condition_elem.text.strip().lower()
-                    
-                    if 'psa 10' in condition:
-                        psa_10_prices.append(price)
-                    elif 'psa 9' in condition:
-                        psa_9_prices.append(price)
-                    else:
-                        raw_prices.append(price)
-                        
-                except (ValueError, AttributeError) as e:
-                    logger.warning(f"Error parsing sale entry: {str(e)}")
+                    price_text = price_elem.text.strip()
+                    price = float(re.sub(r'[^\d.]', '', price_text))
+                    prices.append(price)
+                except (ValueError, AttributeError):
                     continue
             
+            if not prices:
+                return None
+            
+            # Calculate statistics
             return {
-                'raw_avg': statistics.mean(raw_prices) if raw_prices else None,
-                'psa_9_avg': statistics.mean(psa_9_prices) if psa_9_prices else None,
-                'psa_10_avg': statistics.mean(psa_10_prices) if psa_10_prices else None,
-                'raw_count': len(raw_prices),
-                'psa_9_count': len(psa_9_prices),
-                'psa_10_count': len(psa_10_prices)
+                'min_price': min(prices),
+                'max_price': max(prices),
+                'avg_price': statistics.mean(prices),
+                'median_price': statistics.median(prices),
+                'price_count': len(prices)
             }
             
         except Exception as e:
@@ -253,114 +236,78 @@ class ConditionAnalyzer:
     """Analyzes card condition from text and images."""
     
     def __init__(self):
-        self.japanese_grade_patterns = {
-            'SS': r'SSランク|新品未使用|完全美品',
-            'S': r'Sランク|未使用.*初期傷.*微妙',
-            'A': r'Aランク|未使用.*凹み.*初期傷.*目立つレベルではない',
-            'B+': r'B\+ランク|未使用品.*凹み.*初期傷.*目立つ傷',
-            'B': r'Bランク|中古品.*使用感あり.*初期傷.*プレイ時の傷',
-            'C': r'Cランク|中古品.*使用感あり.*目立つレベルの傷',
-            'D': r'Dランク|中古品.*ボロボロ',
-            'E': r'Eランク|ジャンク品'
-        }
-        
-        self.condition_terms = {
-            'new': [
-                '新品', '未使用', 'SSランク', 'Sランク', '完全美品',
-                'new', 'mint', 'unused', 'sealed'
+        self.condition_keywords = {
+            'mint': [
+                'mint', 'mint condition', 'mint state',
+                '未使用', '新品', '美品', '完全美品',
+                'psa 10', 'bgs 10', 'psa 9.5', 'bgs 9.5'
             ],
-            'used': [
-                '中古', '使用済み', '使用感あり', 'プレイ済み',
-                'used', 'played', 'second-hand'
+            'near_mint': [
+                'near mint', 'nm', 'nm-mt', 'near mint condition',
+                'ほぼ新品', 'ほぼ未使用', '極美品', '極上美品'
             ],
-            'damaged': [
-                '傷あり', '凹み', '白欠け', 'スレ', '初期傷',
-                'damaged', 'scratched', 'dented', 'wear'
+            'excellent': [
+                'excellent', 'ex', 'ex-mt', 'excellent condition',
+                '美品', '上美品', '優良品'
+            ],
+            'very_good': [
+                'very good', 'vg', 'vg-ex', 'very good condition',
+                '良品', '良好品'
+            ],
+            'good': [
+                'good', 'g', 'good condition',
+                '並品', '普通品'
+            ],
+            'light_played': [
+                'light played', 'lp', 'lightly played',
+                'やや傷あり', '軽い傷あり'
+            ],
+            'played': [
+                'played', 'p', 'played condition',
+                '傷あり', '使用感あり'
+            ],
+            'poor': [
+                'poor', 'damaged', 'heavily played', 'hp',
+                '傷みあり', '破損あり', '状態悪い'
             ]
         }
     
     def analyze_condition(self, title: str, description: str, image_analysis: Optional[Dict] = None) -> Dict[str, Any]:
-        """Analyze the condition of an item based on title, description, and optional image analysis."""
-        # Combine title and description for analysis
-        full_text = f"{title} {description}"
-        
-        # Initialize condition info
-        condition_info = {
-            'is_new': False,
-            'is_used': False,
-            'is_unopened': False,
-            'is_played': False,
-            'is_scratched': False,
-            'is_damaged': False,
-            'condition_notes': [],
-            'condition_summary': 'Unknown',
-            'damage_flags': [],
-            'image_text_discrepancy': False,
-            'japanese_grade': None
+        """Analyze card condition from text and image analysis."""
+        result = {
+            'condition': None,
+            'confidence': 0.0,
+            'indicators': [],
+            'warnings': []
         }
         
-        # Check for Japanese grading system
-        for grade, pattern in self.japanese_grade_patterns.items():
-            if re.search(pattern, full_text, re.IGNORECASE):
-                condition_info['japanese_grade'] = grade
-                condition_info['condition_summary'] = f"Grade {grade}"
-                
-                # Set condition flags based on grade
-                if grade in ['SS', 'S']:
-                    condition_info['is_new'] = True
-                    condition_info['is_unopened'] = True
-                elif grade in ['A', 'B+']:
-                    condition_info['is_new'] = True
-                    condition_info['is_scratched'] = True
-                elif grade in ['B', 'C']:
-                    condition_info['is_used'] = True
-                    condition_info['is_played'] = True
-                    condition_info['is_scratched'] = True
-                elif grade in ['D', 'E']:
-                    condition_info['is_used'] = True
-                    condition_info['is_damaged'] = True
-                
-                break
+        # Analyze text
+        text = f"{title} {description}".lower()
+        found_conditions = []
         
-        # If no Japanese grade found, fall back to standard analysis
-        if not condition_info['japanese_grade']:
-            # Check for condition terms
-            for condition_type, terms in self.condition_terms.items():
-                for term in terms:
-                    if term.lower() in full_text.lower():
-                        if condition_type == 'new':
-                            condition_info['is_new'] = True
-                            condition_info['is_unopened'] = True
-                        elif condition_type == 'used':
-                            condition_info['is_used'] = True
-                            condition_info['is_played'] = True
-                        elif condition_type == 'damaged':
-                            condition_info['is_damaged'] = True
-                            condition_info['is_scratched'] = True
-                        
-                        condition_info['condition_notes'].append(f"Found {condition_type} indicator: {term}")
-            
-            # Set condition summary
-            if condition_info['is_new']:
-                condition_info['condition_summary'] = 'New'
-            elif condition_info['is_used']:
-                if condition_info['is_damaged']:
-                    condition_info['condition_summary'] = 'Used - Damaged'
-                elif condition_info['is_scratched']:
-                    condition_info['condition_summary'] = 'Used - Scratched'
-                else:
-                    condition_info['condition_summary'] = 'Used'
+        for condition, keywords in self.condition_keywords.items():
+            for keyword in keywords:
+                if keyword.lower() in text:
+                    found_conditions.append(condition)
+                    result['indicators'].append(f"Found '{keyword}' in text")
         
-        # Add image analysis if available
+        if found_conditions:
+            # Use the best condition found
+            condition_order = ['mint', 'near_mint', 'excellent', 'very_good', 'good', 'light_played', 'played', 'poor']
+            best_condition = min(found_conditions, key=lambda x: condition_order.index(x))
+            result['condition'] = best_condition
+            result['confidence'] += 0.6  # Text analysis provides good confidence
+        
+        # Incorporate image analysis if available
         if image_analysis:
-            image_condition = image_analysis.get('condition', {}).get('summary', '').lower()
-            
-            # Check for discrepancies between text and image analysis
-            if condition_info['is_new'] and 'damaged' in image_condition:
-                condition_info['image_text_discrepancy'] = True
-                condition_info['damage_flags'].append('Image shows damage but listed as new')
-            elif condition_info['is_used'] and 'mint' in image_condition:
-                condition_info['image_text_discrepancy'] = True
-                condition_info['damage_flags'].append('Image shows mint condition but listed as used')
+            if image_analysis.get('is_damaged'):
+                result['warnings'].append("Image analysis indicates damage")
+                if result['condition'] in ['mint', 'near_mint']:
+                    result['confidence'] -= 0.3  # Reduce confidence if image contradicts text
+            else:
+                result['confidence'] += 0.2  # Image analysis supports good condition
         
-        return condition_info 
+        # Normalize confidence
+        result['confidence'] = min(result['confidence'], 1.0)
+        
+        return result 
