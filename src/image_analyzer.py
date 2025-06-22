@@ -240,33 +240,63 @@ Respond ONLY with a JSON object in the following format:
             logger.error(f"Error in Gemini analysis: {str(e)}")
             return None
     
-    def analyze_image(self, image_urls: List[str]) -> Optional[Dict[str, Any]]:
-        """Main method to analyze images with proper error handling and fallback."""
+    def analyze_image(self, image_url: str) -> Dict[str, Any]:
+        """Analyze an image using OpenAI's Vision API."""
         try:
-            # Get the largest available image
-            image_content, selected_url = self.get_largest_image(image_urls)
-            if not image_content:
-                logger.error("Failed to download any image for analysis.")
-                return None
-            
-            logger.info("Attempting image analysis with OpenAI...")
-            result = self.analyze_with_openai(image_content, selected_url)
-            
-            # If OpenAI fails, try Gemini
-            if not result:
-                logger.info("OpenAI analysis failed or returned no result, attempting with Gemini...")
-                result = self.analyze_with_gemini(image_content, selected_url)
-            
-            if result:
-                logger.info(f"Successfully analyzed image using {result['source']}")
-                return result
-            else:
-                logger.error("Both OpenAI and Gemini analysis failed or returned no result.")
-                return None
-                
+            # Download the image
+            response = requests.get(image_url)
+            if response.status_code != 200:
+                logger.error(f"Failed to download image from {image_url}")
+                return {"error": "Failed to download image"}
+
+            # Prepare the image for analysis
+            image_data = base64.b64encode(response.content).decode('utf-8')
+
+            # Make the API call with the updated model
+            response = openai.ChatCompletion.create(
+                model="gpt-4-vision-preview",  # Updated model name
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "You are a Yu-Gi-Oh card expert. Analyze the card image and provide detailed information about its condition and authenticity."
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": "Analyze this Yu-Gi-Oh card image and provide information about:\n1. Card condition\n2. Authenticity\n3. Any visible damage or wear\n4. Card centering\n5. Surface quality\nFormat the response as a JSON object."
+                            },
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": f"data:image/jpeg;base64,{image_data}"
+                                }
+                            }
+                        ]
+                    }
+                ],
+                max_tokens=500
+            )
+
+            # Extract and parse the response
+            analysis_text = response.choices[0].message.content
+            try:
+                analysis = json.loads(analysis_text)
+                return analysis
+            except json.JSONDecodeError:
+                logger.error(f"Failed to parse OpenAI response as JSON: {analysis_text}")
+                return {
+                    "error": "Failed to parse analysis",
+                    "raw_response": analysis_text
+                }
+
+        except openai.error.APIError as e:
+            logger.error(f"OpenAI API error: {str(e)}")
+            return {"error": f"API error: {str(e)}"}
         except Exception as e:
-            logger.error(f"An unexpected error occurred during image analysis: {str(e)}")
-            return None
+            logger.error(f"Error in image analysis: {str(e)}")
+            return {"error": f"Analysis error: {str(e)}"}
 
 # Example Usage
 if __name__ == "__main__":
@@ -285,7 +315,7 @@ if __name__ == "__main__":
     ]
 
     analyzer = ImageAnalyzer()
-    analysis_result = analyzer.analyze_image(example_image_urls)
+    analysis_result = analyzer.analyze_image(example_image_urls[0])
 
     if analysis_result:
         print("\n--- Analysis Result ---")
